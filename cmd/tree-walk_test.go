@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2016 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2016 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,60 +17,18 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"io/ioutil"
+	"os"
 	"reflect"
 	"sort"
-	"strings"
 	"testing"
 	"time"
 )
 
 // Fixed volume name that could be used across tests
 const volume = "testvolume"
-
-// Test for delayIsLeafCheck.
-func TestDelayIsLeafCheck(t *testing.T) {
-	testCases := []struct {
-		entries []string
-		delay   bool
-	}{
-		// Test cases where isLeaf check can't be delayed.
-		{
-			[]string{"a-b/", "a/"},
-			false,
-		},
-		{
-			[]string{"a%b/", "a/"},
-			false,
-		},
-		{
-			[]string{"a-b-c", "a-b/"},
-			false,
-		},
-
-		// Test cases where isLeaf check can be delayed.
-		{
-			[]string{"a-b/", "aa/"},
-			true,
-		},
-		{
-			[]string{"a", "a-b"},
-			true,
-		},
-		{
-			[]string{"aaa", "bbb"},
-			true,
-		},
-	}
-	for i, testCase := range testCases {
-		expected := testCase.delay
-		got := delayIsLeafCheck(testCase.entries)
-		if expected != got {
-			t.Errorf("Test %d : Expected %t got %t", i+1, expected, got)
-		}
-	}
-}
 
 // Test for filterMatchingPrefix.
 func TestFilterMatchingPrefix(t *testing.T) {
@@ -127,26 +85,26 @@ func createNamespace(disk StorageAPI, volume string, files []string) error {
 
 // Test if tree walker returns entries matching prefix alone are received
 // when a non empty prefix is supplied.
-func testTreeWalkPrefix(t *testing.T, listDir listDirFunc, isLeaf isLeafFunc) {
+func testTreeWalkPrefix(t *testing.T, listDir ListDirFunc) {
 	// Start the tree walk go-routine.
 	prefix := "d/"
 	endWalkCh := make(chan struct{})
-	twResultCh := startTreeWalk(volume, prefix, "", true, listDir, isLeaf, endWalkCh)
+	twResultCh := startTreeWalk(context.Background(), volume, prefix, "", true, listDir, endWalkCh)
 
 	// Check if all entries received on the channel match the prefix.
 	for res := range twResultCh {
-		if !strings.HasPrefix(res.entry, prefix) {
+		if !hasPrefix(res.entry, prefix) {
 			t.Errorf("Entry %s doesn't match prefix %s", res.entry, prefix)
 		}
 	}
 }
 
 // Test if entries received on tree walk's channel appear after the supplied marker.
-func testTreeWalkMarker(t *testing.T, listDir listDirFunc, isLeaf isLeafFunc) {
+func testTreeWalkMarker(t *testing.T, listDir ListDirFunc) {
 	// Start the tree walk go-routine.
 	prefix := ""
 	endWalkCh := make(chan struct{})
-	twResultCh := startTreeWalk(volume, prefix, "d/g", true, listDir, isLeaf, endWalkCh)
+	twResultCh := startTreeWalk(context.Background(), volume, prefix, "d/g", true, listDir, endWalkCh)
 
 	// Check if only 3 entries, namely d/g/h, i/j/k, lmn are received on the channel.
 	expectedCount := 3
@@ -161,13 +119,14 @@ func testTreeWalkMarker(t *testing.T, listDir listDirFunc, isLeaf isLeafFunc) {
 
 // Test tree-walk.
 func TestTreeWalk(t *testing.T) {
-	fsDir, err := ioutil.TempDir("", "minio-")
+	fsDir, err := ioutil.TempDir(globalTestTmpDir, "minio-")
 	if err != nil {
-		t.Errorf("Unable to create tmp directory: %s", err)
+		t.Fatalf("Unable to create tmp directory: %s", err)
 	}
-	disk, err := newStorageAPI(fsDir)
+	endpoints := mustGetNewEndpointList(fsDir)
+	disk, err := newStorageAPI(endpoints[0])
 	if err != nil {
-		t.Errorf("Unable to create StorageAPI: %s", err)
+		t.Fatalf("Unable to create StorageAPI: %s", err)
 	}
 
 	var files = []string{
@@ -182,15 +141,14 @@ func TestTreeWalk(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	isLeaf := func(volume, prefix string) bool {
-		return !strings.HasSuffix(prefix, slashSeparator)
-	}
-	listDir := listDirFactory(isLeaf, disk)
+	listDir := listDirFactory(context.Background(), disk)
+
 	// Simple test for prefix based walk.
-	testTreeWalkPrefix(t, listDir, isLeaf)
+	testTreeWalkPrefix(t, listDir)
 	// Simple test when marker is set.
-	testTreeWalkMarker(t, listDir, isLeaf)
-	err = removeAll(fsDir)
+	testTreeWalkMarker(t, listDir)
+
+	err = os.RemoveAll(fsDir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -198,13 +156,14 @@ func TestTreeWalk(t *testing.T) {
 
 // Test if tree walk go-routine exits cleanly if tree walk is aborted because of timeout.
 func TestTreeWalkTimeout(t *testing.T) {
-	fsDir, err := ioutil.TempDir("", "minio-")
+	fsDir, err := ioutil.TempDir(globalTestTmpDir, "minio-")
 	if err != nil {
-		t.Errorf("Unable to create tmp directory: %s", err)
+		t.Fatalf("Unable to create tmp directory: %s", err)
 	}
-	disk, err := newStorageAPI(fsDir)
+	endpoints := mustGetNewEndpointList(fsDir)
+	disk, err := newStorageAPI(endpoints[0])
 	if err != nil {
-		t.Errorf("Unable to create StorageAPI: %s", err)
+		t.Fatalf("Unable to create StorageAPI: %s", err)
 	}
 	var myfiles []string
 	// Create maxObjectsList+1 number of entries.
@@ -216,19 +175,16 @@ func TestTreeWalkTimeout(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	isLeaf := func(volume, prefix string) bool {
-		return !strings.HasSuffix(prefix, slashSeparator)
-	}
-	listDir := listDirFactory(isLeaf, disk)
+	listDir := listDirFactory(context.Background(), disk)
 
 	// TreeWalk pool with 2 seconds timeout for tree-walk go routines.
-	pool := newTreeWalkPool(2 * time.Second)
+	pool := NewTreeWalkPool(2 * time.Second)
 
 	endWalkCh := make(chan struct{})
 	prefix := ""
 	marker := ""
 	recursive := true
-	resultCh := startTreeWalk(volume, prefix, marker, recursive, listDir, isLeaf, endWalkCh)
+	resultCh := startTreeWalk(context.Background(), volume, prefix, marker, recursive, listDir, endWalkCh)
 
 	params := listParams{
 		bucket:    volume,
@@ -257,7 +213,7 @@ func TestTreeWalkTimeout(t *testing.T) {
 	if ok {
 		t.Error("Tree-walk go routine has not exited after timeout.")
 	}
-	err = removeAll(fsDir)
+	err = os.RemoveAll(fsDir)
 	if err != nil {
 		t.Error(err)
 	}
@@ -269,29 +225,30 @@ func TestListDir(t *testing.T) {
 	file1 := "file1"
 	file2 := "file2"
 	// Create two backend directories fsDir1 and fsDir2.
-	fsDir1, err := ioutil.TempDir("", "minio-")
+	fsDir1, err := ioutil.TempDir(globalTestTmpDir, "minio-")
 	if err != nil {
 		t.Errorf("Unable to create tmp directory: %s", err)
 	}
-	fsDir2, err := ioutil.TempDir("", "minio-")
+	fsDir2, err := ioutil.TempDir(globalTestTmpDir, "minio-")
 	if err != nil {
 		t.Errorf("Unable to create tmp directory: %s", err)
 	}
 
 	// Create two StorageAPIs disk1 and disk2.
-	disk1, err := newStorageAPI(fsDir1)
+	endpoints := mustGetNewEndpointList(fsDir1)
+	disk1, err := newStorageAPI(endpoints[0])
 	if err != nil {
 		t.Errorf("Unable to create StorageAPI: %s", err)
 	}
-	disk2, err := newStorageAPI(fsDir2)
+
+	endpoints = mustGetNewEndpointList(fsDir2)
+	disk2, err := newStorageAPI(endpoints[0])
 	if err != nil {
 		t.Errorf("Unable to create StorageAPI: %s", err)
 	}
 
 	// create listDir function.
-	listDir := listDirFactory(func(volume, prefix string) bool {
-		return !strings.HasSuffix(prefix, slashSeparator)
-	}, disk1, disk2)
+	listDir := listDirFactory(context.Background(), disk1, disk2)
 
 	// Create file1 in fsDir1 and file2 in fsDir2.
 	disks := []StorageAPI{disk1, disk2}
@@ -303,42 +260,34 @@ func TestListDir(t *testing.T) {
 	}
 
 	// Should list "file1" from fsDir1.
-	entries, _, err := listDir(volume, "", "")
-	if err != nil {
-		t.Error(err)
-	}
-	if len(entries) != 1 {
-		t.Fatal("Expected the number of entries to be 1")
+	entries := listDir(volume, "", "")
+	if len(entries) != 2 {
+		t.Fatal("Expected the number of entries to be 2")
 	}
 	if entries[0] != file1 {
 		t.Fatal("Expected the entry to be file1")
 	}
+	if entries[1] != file2 {
+		t.Fatal("Expected the entry to be file2")
+	}
 
-	// Remove fsDir1 to test failover.
-	err = removeAll(fsDir1)
+	// Remove fsDir1, list should return entries from fsDir2
+	err = os.RemoveAll(fsDir1)
 	if err != nil {
 		t.Error(err)
 	}
 
 	// Should list "file2" from fsDir2.
-	entries, _, err = listDir(volume, "", "")
-	if err != nil {
-		t.Error(err)
-	}
+	entries = listDir(volume, "", "")
 	if len(entries) != 1 {
 		t.Fatal("Expected the number of entries to be 1")
 	}
 	if entries[0] != file2 {
 		t.Fatal("Expected the entry to be file2")
 	}
-	err = removeAll(fsDir2)
+	err = os.RemoveAll(fsDir2)
 	if err != nil {
 		t.Error(err)
-	}
-	// None of the disks are available, should get errDiskNotFound.
-	_, _, err = listDir(volume, "", "")
-	if err != errDiskNotFound {
-		t.Error("expected errDiskNotFound error.")
 	}
 }
 
@@ -346,24 +295,19 @@ func TestListDir(t *testing.T) {
 // without recursively traversing prefixes.
 func TestRecursiveTreeWalk(t *testing.T) {
 	// Create a backend directories fsDir1.
-	fsDir1, err := ioutil.TempDir("", "minio-")
+	fsDir1, err := ioutil.TempDir(globalTestTmpDir, "minio-")
 	if err != nil {
-		t.Errorf("Unable to create tmp directory: %s", err)
+		t.Fatalf("Unable to create tmp directory: %s", err)
 	}
 
-	// Create two StorageAPIs disk1.
-	disk1, err := newStorageAPI(fsDir1)
+	endpoints := mustGetNewEndpointList(fsDir1)
+	disk1, err := newStorageAPI(endpoints[0])
 	if err != nil {
-		t.Errorf("Unable to create StorageAPI: %s", err)
-	}
-
-	// Simple isLeaf check, returns true if there is no trailing "/"
-	isLeaf := func(volume, prefix string) bool {
-		return !strings.HasSuffix(prefix, slashSeparator)
+		t.Fatalf("Unable to create StorageAPI: %s", err)
 	}
 
 	// Create listDir function.
-	listDir := listDirFactory(isLeaf, disk1)
+	listDir := listDirFactory(context.Background(), disk1)
 
 	// Create the namespace.
 	var files = []string{
@@ -437,15 +381,18 @@ func TestRecursiveTreeWalk(t *testing.T) {
 		}},
 	}
 	for i, testCase := range testCases {
-		for entry := range startTreeWalk(volume,
-			testCase.prefix, testCase.marker, testCase.recursive,
-			listDir, isLeaf, endWalkCh) {
-			if _, found := testCase.expected[entry.entry]; !found {
-				t.Errorf("Test %d: Expected %s, but couldn't find", i+1, entry.entry)
+		testCase := testCase
+		t.Run(fmt.Sprintf("Test%d", i+1), func(t *testing.T) {
+			for entry := range startTreeWalk(context.Background(), volume,
+				testCase.prefix, testCase.marker, testCase.recursive,
+				listDir, endWalkCh) {
+				if _, found := testCase.expected[entry.entry]; !found {
+					t.Errorf("Expected %s, but couldn't find", entry.entry)
+				}
 			}
-		}
+		})
 	}
-	err = removeAll(fsDir1)
+	err = os.RemoveAll(fsDir1)
 	if err != nil {
 		t.Error(err)
 	}
@@ -453,23 +400,19 @@ func TestRecursiveTreeWalk(t *testing.T) {
 
 func TestSortedness(t *testing.T) {
 	// Create a backend directories fsDir1.
-	fsDir1, err := ioutil.TempDir("", "minio-")
+	fsDir1, err := ioutil.TempDir(globalTestTmpDir, "minio-")
 	if err != nil {
 		t.Errorf("Unable to create tmp directory: %s", err)
 	}
 
-	// Create two StorageAPIs disk1.
-	disk1, err := newStorageAPI(fsDir1)
+	endpoints := mustGetNewEndpointList(fsDir1)
+	disk1, err := newStorageAPI(endpoints[0])
 	if err != nil {
-		t.Errorf("Unable to create StorageAPI: %s", err)
+		t.Fatalf("Unable to create StorageAPI: %s", err)
 	}
 
-	// Simple isLeaf check, returns true if there is no trailing "/"
-	isLeaf := func(volume, prefix string) bool {
-		return !strings.HasSuffix(prefix, slashSeparator)
-	}
 	// Create listDir function.
-	listDir := listDirFactory(isLeaf, disk1)
+	listDir := listDirFactory(context.Background(), disk1)
 
 	// Create the namespace.
 	var files = []string{
@@ -509,9 +452,9 @@ func TestSortedness(t *testing.T) {
 	}
 	for i, test := range testCases {
 		var actualEntries []string
-		for entry := range startTreeWalk(volume,
+		for entry := range startTreeWalk(context.Background(), volume,
 			test.prefix, test.marker, test.recursive,
-			listDir, isLeaf, endWalkCh) {
+			listDir, endWalkCh) {
 			actualEntries = append(actualEntries, entry.entry)
 		}
 		if !sort.IsSorted(sort.StringSlice(actualEntries)) {
@@ -520,7 +463,7 @@ func TestSortedness(t *testing.T) {
 	}
 
 	// Remove directory created for testing
-	err = removeAll(fsDir1)
+	err = os.RemoveAll(fsDir1)
 	if err != nil {
 		t.Error(err)
 	}
@@ -528,22 +471,19 @@ func TestSortedness(t *testing.T) {
 
 func TestTreeWalkIsEnd(t *testing.T) {
 	// Create a backend directories fsDir1.
-	fsDir1, err := ioutil.TempDir("", "minio-")
+	fsDir1, err := ioutil.TempDir(globalTestTmpDir, "minio-")
 	if err != nil {
 		t.Errorf("Unable to create tmp directory: %s", err)
 	}
 
-	// Create two StorageAPIs disk1.
-	disk1, err := newStorageAPI(fsDir1)
+	endpoints := mustGetNewEndpointList(fsDir1)
+	disk1, err := newStorageAPI(endpoints[0])
 	if err != nil {
-		t.Errorf("Unable to create StorageAPI: %s", err)
+		t.Fatalf("Unable to create StorageAPI: %s", err)
 	}
 
-	isLeaf := func(volume, prefix string) bool {
-		return !strings.HasSuffix(prefix, slashSeparator)
-	}
 	// Create listDir function.
-	listDir := listDirFactory(isLeaf, disk1)
+	listDir := listDirFactory(context.Background(), disk1)
 
 	// Create the namespace.
 	var files = []string{
@@ -583,8 +523,9 @@ func TestTreeWalkIsEnd(t *testing.T) {
 		{"d/", "d/e", true, "d/g/h"},
 	}
 	for i, test := range testCases {
-		var entry treeWalkResult
-		for entry = range startTreeWalk(volume, test.prefix, test.marker, test.recursive, listDir, isLeaf, endWalkCh) {
+		var entry TreeWalkResult
+		for entry = range startTreeWalk(context.Background(), volume, test.prefix,
+			test.marker, test.recursive, listDir, endWalkCh) {
 		}
 		if entry.entry != test.expectedEntry {
 			t.Errorf("Test %d: Expected entry %s, but received %s with the EOF marker", i, test.expectedEntry, entry.entry)
@@ -595,7 +536,7 @@ func TestTreeWalkIsEnd(t *testing.T) {
 	}
 
 	// Remove directory created for testing
-	err = removeAll(fsDir1)
+	err = os.RemoveAll(fsDir1)
 	if err != nil {
 		t.Error(err)
 	}

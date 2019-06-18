@@ -1,6 +1,6 @@
 # For maintainers only
 
-### Setup your minio Github Repository
+### Setup your minio GitHub Repository
 
 Fork [minio upstream](https://github.com/minio/minio/fork) source repository to your own personal repository.
 ```bash
@@ -18,7 +18,7 @@ $
 
   - Run `go get foo/bar`
   - Edit your code to import foo/bar
-  - Run `govendor add foo/bar` from top-level folder
+  - Run `govendor add foo/bar` from top-level directory
 
 #### Remove dependencies 
 

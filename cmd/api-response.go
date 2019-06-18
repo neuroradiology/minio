@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2015, 2016 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2015, 2016, 2017, 2018 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,17 +17,24 @@
 package cmd
 
 import (
+	"context"
 	"encoding/xml"
 	"net/http"
+	"net/url"
 	"path"
+	"strconv"
+	"strings"
 	"time"
+
+	"github.com/minio/minio/cmd/logger"
+	"github.com/minio/minio/pkg/handlers"
 )
 
 const (
-	timeFormatAMZ  = "2006-01-02T15:04:05.000Z" // Reply date format
-	maxObjectList  = 1000                       // Limit number of objects in a listObjectsResponse.
-	maxUploadsList = 1000                       // Limit number of uploads in a listUploadsResponse.
-	maxPartsList   = 1000                       // Limit number of parts in a listPartsResponse.
+	timeFormatAMZLong = "2006-01-02T15:04:05.000Z" // Reply date format with nanosecond precision.
+	maxObjectList     = 1000                       // Limit number of objects in a listObjectsResponse.
+	maxUploadsList    = 1000                       // Limit number of uploads in a listUploadsResponse.
+	maxPartsList      = 1000                       // Limit number of parts in a listPartsResponse.
 )
 
 // LocationResponse - format for location response.
@@ -40,20 +47,9 @@ type LocationResponse struct {
 type ListObjectsResponse struct {
 	XMLName xml.Name `xml:"http://s3.amazonaws.com/doc/2006-03-01/ ListBucketResult" json:"-"`
 
-	CommonPrefixes []CommonPrefix
-	Contents       []Object
-
-	Delimiter string
-
-	// Encoding type used to encode object keys in the response.
-	EncodingType string
-
-	// A flag that indicates whether or not ListObjects returned all of the results
-	// that satisfied the search criteria.
-	IsTruncated bool
-	Marker      string
-	MaxKeys     int
-	Name        string
+	Name   string
+	Prefix string
+	Marker string
 
 	// When response is truncated (the IsTruncated element value in the response
 	// is true), you can use the key name in this field as marker in the subsequent
@@ -62,29 +58,28 @@ type ListObjectsResponse struct {
 	// specified. If response does not include the NextMaker and it is truncated,
 	// you can use the value of the last Key in the response as the marker in the
 	// subsequent request to get the next set of object keys.
-	NextMarker string
-	Prefix     string
+	NextMarker string `xml:"NextMarker,omitempty"`
+
+	MaxKeys   int
+	Delimiter string
+	// A flag that indicates whether or not ListObjects returned all of the results
+	// that satisfied the search criteria.
+	IsTruncated bool
+
+	Contents       []Object
+	CommonPrefixes []CommonPrefix
+
+	// Encoding type used to encode object keys in the response.
+	EncodingType string `xml:"EncodingType,omitempty"`
 }
 
 // ListObjectsV2Response - format for list objects response.
 type ListObjectsV2Response struct {
 	XMLName xml.Name `xml:"http://s3.amazonaws.com/doc/2006-03-01/ ListBucketResult" json:"-"`
 
-	CommonPrefixes []CommonPrefix
-	Contents       []Object
-
-	Delimiter string
-
-	// Encoding type used to encode object keys in the response.
-	EncodingType string
-
-	// A flag that indicates whether or not ListObjects returned all of the results
-	// that satisfied the search criteria.
-	IsTruncated bool
-	StartAfter  string
-	MaxKeys     int
-	Name        string
-
+	Name       string
+	Prefix     string
+	StartAfter string `xml:"StartAfter,omitempty"`
 	// When response is truncated (the IsTruncated element value in the response
 	// is true), you can use the key name in this field as marker in the subsequent
 	// request to get next set of objects. Server lists objects in alphabetical
@@ -92,16 +87,28 @@ type ListObjectsV2Response struct {
 	// specified. If response does not include the NextMaker and it is truncated,
 	// you can use the value of the last Key in the response as the marker in the
 	// subsequent request to get the next set of object keys.
-	ContinuationToken     string
-	NextContinuationToken string
-	Prefix                string
+	ContinuationToken     string `xml:"ContinuationToken,omitempty"`
+	NextContinuationToken string `xml:"NextContinuationToken,omitempty"`
+
+	KeyCount  int
+	MaxKeys   int
+	Delimiter string
+	// A flag that indicates whether or not ListObjects returned all of the results
+	// that satisfied the search criteria.
+	IsTruncated bool
+
+	Contents       []Object
+	CommonPrefixes []CommonPrefix
+
+	// Encoding type used to encode object keys in the response.
+	EncodingType string `xml:"EncodingType,omitempty"`
 }
 
 // Part container for part metadata.
 type Part struct {
 	PartNumber   int
-	ETag         string
 	LastModified string
+	ETag         string
 	Size         int64
 }
 
@@ -137,23 +144,29 @@ type ListMultipartUploadsResponse struct {
 	UploadIDMarker     string `xml:"UploadIdMarker"`
 	NextKeyMarker      string
 	NextUploadIDMarker string `xml:"NextUploadIdMarker"`
-	EncodingType       string
+	Delimiter          string
+	Prefix             string
+	EncodingType       string `xml:"EncodingType,omitempty"`
 	MaxUploads         int
 	IsTruncated        bool
-	Uploads            []Upload `xml:"Upload"`
-	Prefix             string
-	Delimiter          string
-	CommonPrefixes     []CommonPrefix
+
+	// List of pending uploads.
+	Uploads []Upload `xml:"Upload"`
+
+	// Delimed common prefixes.
+	CommonPrefixes []CommonPrefix
 }
 
 // ListBucketsResponse - format for list buckets response
 type ListBucketsResponse struct {
 	XMLName xml.Name `xml:"http://s3.amazonaws.com/doc/2006-03-01/ ListAllMyBucketsResult" json:"-"`
+
+	Owner Owner
+
 	// Container for one or more buckets.
 	Buckets struct {
 		Buckets []Bucket `xml:"Bucket"`
 	} // Buckets are nested
-	Owner Owner
 }
 
 // Upload container for in progress multipart upload
@@ -179,23 +192,30 @@ type Bucket struct {
 
 // Object container for object metadata
 type Object struct {
-	ETag         string
 	Key          string
 	LastModified string // time string of format "2006-01-02T15:04:05.000Z"
+	ETag         string
 	Size         int64
 
+	// Owner of the object.
 	Owner Owner
 
 	// The class of storage used to store the object.
 	StorageClass string
 }
 
-// CopyObjectResponse container returns ETag and LastModified of the
-// successfully copied object
+// CopyObjectResponse container returns ETag and LastModified of the successfully copied object
 type CopyObjectResponse struct {
 	XMLName      xml.Name `xml:"http://s3.amazonaws.com/doc/2006-03-01/ CopyObjectResult" json:"-"`
-	ETag         string
-	LastModified string // time string of format "2006-01-02T15:04:05.000Z"
+	LastModified string   // time string of format "2006-01-02T15:04:05.000Z"
+	ETag         string   // md5sum of the copied object.
+}
+
+// CopyObjectPartResponse container returns ETag and LastModified of the successfully copied object
+type CopyObjectPartResponse struct {
+	XMLName      xml.Name `xml:"http://s3.amazonaws.com/doc/2006-03-01/ CopyPartResult" json:"-"`
+	LastModified string   // time string of format "2006-01-02T15:04:05.000Z"
+	ETag         string   // md5sum of the copied object part.
 }
 
 // Initiator inherit from Owner struct, fields are same
@@ -226,16 +246,6 @@ type CompleteMultipartUploadResponse struct {
 	ETag     string
 }
 
-// PostResponse container for completed post upload response
-type PostResponse struct {
-	XMLName xml.Name `xml:"http://s3.amazonaws.com/doc/2006-03-01/ PostResponse" json:"-"`
-
-	Location string
-	Bucket   string
-	Key      string
-	ETag     string
-}
-
 // DeleteError structure.
 type DeleteError struct {
 	Code    string
@@ -254,34 +264,60 @@ type DeleteObjectsResponse struct {
 	Errors []DeleteError `xml:"Error,omitempty"`
 }
 
-// getLocation get URL location.
-func getLocation(r *http.Request) string {
-	return path.Clean(r.URL.Path) // Clean any trailing slashes.
+// PostResponse container for POST object request when success_action_status is set to 201
+type PostResponse struct {
+	Bucket   string
+	Key      string
+	ETag     string
+	Location string
 }
 
-// getObjectLocation gets the relative URL for an object
-func getObjectLocation(bucketName string, key string) string {
-	return "/" + bucketName + "/" + key
+// returns "https" if the tls boolean is true, "http" otherwise.
+func getURLScheme(tls bool) string {
+	if tls {
+		return httpsScheme
+	}
+	return httpScheme
 }
 
-// takes an array of Bucketmetadata information for serialization
-// input:
-// array of bucket metadata
-//
-// output:
-// populated struct that can be serialized to match xml and json api spec output
+// getObjectLocation gets the fully qualified URL of an object.
+func getObjectLocation(r *http.Request, domains []string, bucket, object string) string {
+	// unit tests do not have host set.
+	if r.Host == "" {
+		return path.Clean(r.URL.Path)
+	}
+	proto := handlers.GetSourceScheme(r)
+	if proto == "" {
+		proto = getURLScheme(globalIsSSL)
+	}
+	u := &url.URL{
+		Host:   r.Host,
+		Path:   path.Join(slashSeparator, bucket, object),
+		Scheme: proto,
+	}
+	// If domain is set then we need to use bucket DNS style.
+	for _, domain := range domains {
+		if strings.Contains(r.Host, domain) {
+			u.Host = bucket + "." + r.Host
+			u.Path = path.Join(slashSeparator, object)
+			break
+		}
+	}
+	return u.String()
+}
+
+// generates ListBucketsResponse from array of BucketInfo which can be
+// serialized to match XML and JSON API spec output.
 func generateListBucketsResponse(buckets []BucketInfo) ListBucketsResponse {
 	var listbuckets []Bucket
 	var data = ListBucketsResponse{}
 	var owner = Owner{}
 
-	owner.ID = "minio"
-	owner.DisplayName = "minio"
-
+	owner.ID = globalMinioDefaultOwnerID
 	for _, bucket := range buckets {
 		var listbucket = Bucket{}
 		listbucket.Name = bucket.Name
-		listbucket.CreationDate = bucket.Created.Format(timeFormatAMZ)
+		listbucket.CreationDate = bucket.Created.UTC().Format(timeFormatAMZLong)
 		listbuckets = append(listbuckets, listbucket)
 	}
 
@@ -292,44 +328,42 @@ func generateListBucketsResponse(buckets []BucketInfo) ListBucketsResponse {
 }
 
 // generates an ListObjectsV1 response for the said bucket with other enumerated options.
-func generateListObjectsV1Response(bucket, prefix, marker, delimiter string, maxKeys int, resp ListObjectsInfo) ListObjectsResponse {
+func generateListObjectsV1Response(bucket, prefix, marker, delimiter, encodingType string, maxKeys int, resp ListObjectsInfo) ListObjectsResponse {
 	var contents []Object
 	var prefixes []CommonPrefix
 	var owner = Owner{}
 	var data = ListObjectsResponse{}
 
-	owner.ID = "minio"
-	owner.DisplayName = "minio"
-
+	owner.ID = globalMinioDefaultOwnerID
 	for _, object := range resp.Objects {
 		var content = Object{}
 		if object.Name == "" {
 			continue
 		}
-		content.Key = object.Name
-		content.LastModified = object.ModTime.UTC().Format(timeFormatAMZ)
-		if object.MD5Sum != "" {
-			content.ETag = "\"" + object.MD5Sum + "\""
+		content.Key = s3EncodeName(object.Name, encodingType)
+		content.LastModified = object.ModTime.UTC().Format(timeFormatAMZLong)
+		if object.ETag != "" {
+			content.ETag = "\"" + object.ETag + "\""
 		}
 		content.Size = object.Size
-		content.StorageClass = "STANDARD"
+		content.StorageClass = object.StorageClass
 		content.Owner = owner
 		contents = append(contents, content)
 	}
-	// TODO - support EncodingType in xml decoding
 	data.Name = bucket
 	data.Contents = contents
 
-	data.Prefix = prefix
-	data.Marker = marker
-	data.Delimiter = delimiter
+	data.EncodingType = encodingType
+	data.Prefix = s3EncodeName(prefix, encodingType)
+	data.Marker = s3EncodeName(marker, encodingType)
+	data.Delimiter = s3EncodeName(delimiter, encodingType)
 	data.MaxKeys = maxKeys
 
-	data.NextMarker = resp.NextMarker
+	data.NextMarker = s3EncodeName(resp.NextMarker, encodingType)
 	data.IsTruncated = resp.IsTruncated
 	for _, prefix := range resp.Prefixes {
 		var prefixItem = CommonPrefix{}
-		prefixItem.Prefix = prefix
+		prefixItem.Prefix = s3EncodeName(prefix, encodingType)
 		prefixes = append(prefixes, prefixItem)
 	}
 	data.CommonPrefixes = prefixes
@@ -337,59 +371,69 @@ func generateListObjectsV1Response(bucket, prefix, marker, delimiter string, max
 }
 
 // generates an ListObjectsV2 response for the said bucket with other enumerated options.
-func generateListObjectsV2Response(bucket, prefix, token, startAfter, delimiter string, maxKeys int, resp ListObjectsInfo) ListObjectsV2Response {
+func generateListObjectsV2Response(bucket, prefix, token, nextToken, startAfter, delimiter, encodingType string, fetchOwner, isTruncated bool, maxKeys int, objects []ObjectInfo, prefixes []string) ListObjectsV2Response {
 	var contents []Object
-	var prefixes []CommonPrefix
+	var commonPrefixes []CommonPrefix
 	var owner = Owner{}
 	var data = ListObjectsV2Response{}
 
-	owner.ID = "minio"
-	owner.DisplayName = "minio"
+	if fetchOwner {
+		owner.ID = globalMinioDefaultOwnerID
+	}
 
-	for _, object := range resp.Objects {
+	for _, object := range objects {
 		var content = Object{}
 		if object.Name == "" {
 			continue
 		}
-		content.Key = object.Name
-		content.LastModified = object.ModTime.UTC().Format(timeFormatAMZ)
-		if object.MD5Sum != "" {
-			content.ETag = "\"" + object.MD5Sum + "\""
+		content.Key = s3EncodeName(object.Name, encodingType)
+		content.LastModified = object.ModTime.UTC().Format(timeFormatAMZLong)
+		if object.ETag != "" {
+			content.ETag = "\"" + object.ETag + "\""
 		}
 		content.Size = object.Size
-		content.StorageClass = "STANDARD"
+		content.StorageClass = object.StorageClass
 		content.Owner = owner
 		contents = append(contents, content)
 	}
-	// TODO - support EncodingType in xml decoding
 	data.Name = bucket
 	data.Contents = contents
 
-	data.StartAfter = startAfter
-	data.Delimiter = delimiter
-	data.Prefix = prefix
+	data.EncodingType = encodingType
+	data.StartAfter = s3EncodeName(startAfter, encodingType)
+	data.Delimiter = s3EncodeName(delimiter, encodingType)
+	data.Prefix = s3EncodeName(prefix, encodingType)
 	data.MaxKeys = maxKeys
 	data.ContinuationToken = token
-	data.NextContinuationToken = resp.NextMarker
-	data.IsTruncated = resp.IsTruncated
-	for _, prefix := range resp.Prefixes {
+	data.NextContinuationToken = nextToken
+	data.IsTruncated = isTruncated
+	for _, prefix := range prefixes {
 		var prefixItem = CommonPrefix{}
-		prefixItem.Prefix = prefix
-		prefixes = append(prefixes, prefixItem)
+		prefixItem.Prefix = s3EncodeName(prefix, encodingType)
+		commonPrefixes = append(commonPrefixes, prefixItem)
 	}
-	data.CommonPrefixes = prefixes
+	data.CommonPrefixes = commonPrefixes
+	data.KeyCount = len(data.Contents) + len(data.CommonPrefixes)
 	return data
 }
 
-// generateCopyObjectResponse
+// generates CopyObjectResponse from etag and lastModified time.
 func generateCopyObjectResponse(etag string, lastModified time.Time) CopyObjectResponse {
 	return CopyObjectResponse{
 		ETag:         "\"" + etag + "\"",
-		LastModified: lastModified.UTC().Format(timeFormatAMZ),
+		LastModified: lastModified.UTC().Format(timeFormatAMZLong),
 	}
 }
 
-// generateInitiateMultipartUploadResponse
+// generates CopyObjectPartResponse from etag and lastModified time.
+func generateCopyObjectPartResponse(etag string, lastModified time.Time) CopyObjectPartResponse {
+	return CopyObjectPartResponse{
+		ETag:         "\"" + etag + "\"",
+		LastModified: lastModified.UTC().Format(timeFormatAMZLong),
+	}
+}
+
+// generates InitiateMultipartUploadResponse for given bucket, key and uploadID.
 func generateInitiateMultipartUploadResponse(bucket, key, uploadID string) InitiateMultipartUploadResponse {
 	return InitiateMultipartUploadResponse{
 		Bucket:   bucket,
@@ -398,7 +442,7 @@ func generateInitiateMultipartUploadResponse(bucket, key, uploadID string) Initi
 	}
 }
 
-// generateCompleteMultipartUploadResponse
+// generates CompleteMultipartUploadResponse for given bucket, key, location and ETag.
 func generateCompleteMultpartUploadResponse(bucket, key, location, etag string) CompleteMultipartUploadResponse {
 	return CompleteMultipartUploadResponse{
 		Location: location,
@@ -408,18 +452,15 @@ func generateCompleteMultpartUploadResponse(bucket, key, location, etag string) 
 	}
 }
 
-// generateListPartsResult
-func generateListPartsResponse(partsInfo ListPartsInfo) ListPartsResponse {
-	// TODO - support EncodingType in xml decoding
+// generates ListPartsResponse from ListPartsInfo.
+func generateListPartsResponse(partsInfo ListPartsInfo, encodingType string) ListPartsResponse {
 	listPartsResponse := ListPartsResponse{}
 	listPartsResponse.Bucket = partsInfo.Bucket
-	listPartsResponse.Key = partsInfo.Object
+	listPartsResponse.Key = s3EncodeName(partsInfo.Object, encodingType)
 	listPartsResponse.UploadID = partsInfo.UploadID
-	listPartsResponse.StorageClass = "STANDARD"
-	listPartsResponse.Initiator.ID = "minio"
-	listPartsResponse.Initiator.DisplayName = "minio"
-	listPartsResponse.Owner.ID = "minio"
-	listPartsResponse.Owner.DisplayName = "minio"
+	listPartsResponse.StorageClass = globalMinioDefaultStorageClass
+	listPartsResponse.Initiator.ID = globalMinioDefaultOwnerID
+	listPartsResponse.Owner.ID = globalMinioDefaultOwnerID
 
 	listPartsResponse.MaxParts = partsInfo.MaxParts
 	listPartsResponse.PartNumberMarker = partsInfo.PartNumberMarker
@@ -432,37 +473,37 @@ func generateListPartsResponse(partsInfo ListPartsInfo) ListPartsResponse {
 		newPart.PartNumber = part.PartNumber
 		newPart.ETag = "\"" + part.ETag + "\""
 		newPart.Size = part.Size
-		newPart.LastModified = part.LastModified.UTC().Format(timeFormatAMZ)
+		newPart.LastModified = part.LastModified.UTC().Format(timeFormatAMZLong)
 		listPartsResponse.Parts[index] = newPart
 	}
 	return listPartsResponse
 }
 
-// generateListMultipartUploadsResponse
-func generateListMultipartUploadsResponse(bucket string, multipartsInfo ListMultipartsInfo) ListMultipartUploadsResponse {
+// generates ListMultipartUploadsResponse for given bucket and ListMultipartsInfo.
+func generateListMultipartUploadsResponse(bucket string, multipartsInfo ListMultipartsInfo, encodingType string) ListMultipartUploadsResponse {
 	listMultipartUploadsResponse := ListMultipartUploadsResponse{}
 	listMultipartUploadsResponse.Bucket = bucket
-	listMultipartUploadsResponse.Delimiter = multipartsInfo.Delimiter
+	listMultipartUploadsResponse.Delimiter = s3EncodeName(multipartsInfo.Delimiter, encodingType)
 	listMultipartUploadsResponse.IsTruncated = multipartsInfo.IsTruncated
-	listMultipartUploadsResponse.EncodingType = multipartsInfo.EncodingType
-	listMultipartUploadsResponse.Prefix = multipartsInfo.Prefix
-	listMultipartUploadsResponse.KeyMarker = multipartsInfo.KeyMarker
-	listMultipartUploadsResponse.NextKeyMarker = multipartsInfo.NextKeyMarker
+	listMultipartUploadsResponse.EncodingType = encodingType
+	listMultipartUploadsResponse.Prefix = s3EncodeName(multipartsInfo.Prefix, encodingType)
+	listMultipartUploadsResponse.KeyMarker = s3EncodeName(multipartsInfo.KeyMarker, encodingType)
+	listMultipartUploadsResponse.NextKeyMarker = s3EncodeName(multipartsInfo.NextKeyMarker, encodingType)
 	listMultipartUploadsResponse.MaxUploads = multipartsInfo.MaxUploads
 	listMultipartUploadsResponse.NextUploadIDMarker = multipartsInfo.NextUploadIDMarker
 	listMultipartUploadsResponse.UploadIDMarker = multipartsInfo.UploadIDMarker
 	listMultipartUploadsResponse.CommonPrefixes = make([]CommonPrefix, len(multipartsInfo.CommonPrefixes))
 	for index, commonPrefix := range multipartsInfo.CommonPrefixes {
 		listMultipartUploadsResponse.CommonPrefixes[index] = CommonPrefix{
-			Prefix: commonPrefix,
+			Prefix: s3EncodeName(commonPrefix, encodingType),
 		}
 	}
 	listMultipartUploadsResponse.Uploads = make([]Upload, len(multipartsInfo.Uploads))
 	for index, upload := range multipartsInfo.Uploads {
 		newUpload := Upload{}
 		newUpload.UploadID = upload.UploadID
-		newUpload.Key = upload.Object
-		newUpload.Initiated = upload.Initiated.UTC().Format(timeFormatAMZ)
+		newUpload.Key = s3EncodeName(upload.Object, encodingType)
+		newUpload.Initiated = upload.Initiated.UTC().Format(timeFormatAMZLong)
 		listMultipartUploadsResponse.Uploads[index] = newUpload
 	}
 	return listMultipartUploadsResponse
@@ -478,42 +519,146 @@ func generateMultiDeleteResponse(quiet bool, deletedObjects []ObjectIdentifier, 
 	return deleteResp
 }
 
-// writeSuccessResponse write success headers and response if any.
-func writeSuccessResponse(w http.ResponseWriter, response []byte) {
+func writeResponse(w http.ResponseWriter, statusCode int, response []byte, mType mimeType) {
 	setCommonHeaders(w)
-	if response == nil {
-		w.WriteHeader(http.StatusOK)
-		return
+	if mType != mimeNone {
+		w.Header().Set("Content-Type", string(mType))
 	}
-	w.Write(response)
-	w.(http.Flusher).Flush()
-}
-
-// writeSuccessNoContent write success headers with http status 204
-func writeSuccessNoContent(w http.ResponseWriter) {
-	setCommonHeaders(w)
-	w.WriteHeader(http.StatusNoContent)
-}
-
-// writeErrorRespone write error headers
-func writeErrorResponse(w http.ResponseWriter, req *http.Request, errorCode APIErrorCode, resource string) {
-	error := getAPIError(errorCode)
-	// set common headers
-	setCommonHeaders(w)
-	// write Header
-	w.WriteHeader(error.HTTPStatusCode)
-	writeErrorResponseNoHeader(w, req, errorCode, resource)
-}
-
-func writeErrorResponseNoHeader(w http.ResponseWriter, req *http.Request, errorCode APIErrorCode, resource string) {
-	error := getAPIError(errorCode)
-	// Generate error response.
-	errorResponse := getAPIErrorResponse(error, resource)
-	encodedErrorResponse := encodeResponse(errorResponse)
-	// HEAD should have no body, do not attempt to write to it
-	if req.Method != "HEAD" {
-		// write error body
-		w.Write(encodedErrorResponse)
+	w.Header().Set("Content-Length", strconv.Itoa(len(response)))
+	w.WriteHeader(statusCode)
+	if response != nil {
+		w.Write(response)
 		w.(http.Flusher).Flush()
 	}
+}
+
+// mimeType represents various MIME type used API responses.
+type mimeType string
+
+const (
+	// Means no response type.
+	mimeNone mimeType = ""
+	// Means response type is JSON.
+	mimeJSON mimeType = "application/json"
+	// Means response type is XML.
+	mimeXML mimeType = "application/xml"
+)
+
+// writeSuccessResponseJSON writes success headers and response if any,
+// with content-type set to `application/json`.
+func writeSuccessResponseJSON(w http.ResponseWriter, response []byte) {
+	writeResponse(w, http.StatusOK, response, mimeJSON)
+}
+
+// writeSuccessResponseXML writes success headers and response if any,
+// with content-type set to `application/xml`.
+func writeSuccessResponseXML(w http.ResponseWriter, response []byte) {
+	writeResponse(w, http.StatusOK, response, mimeXML)
+}
+
+// writeSuccessNoContent writes success headers with http status 204
+func writeSuccessNoContent(w http.ResponseWriter) {
+	writeResponse(w, http.StatusNoContent, nil, mimeNone)
+}
+
+// writeRedirectSeeOther writes Location header with http status 303
+func writeRedirectSeeOther(w http.ResponseWriter, location string) {
+	w.Header().Set("Location", location)
+	writeResponse(w, http.StatusSeeOther, nil, mimeNone)
+}
+
+func writeSuccessResponseHeadersOnly(w http.ResponseWriter) {
+	writeResponse(w, http.StatusOK, nil, mimeNone)
+}
+
+// writeErrorRespone writes error headers
+func writeErrorResponse(ctx context.Context, w http.ResponseWriter, err APIError, reqURL *url.URL, browser bool) {
+	switch err.Code {
+	case "SlowDown", "XMinioServerNotInitialized", "XMinioReadQuorum", "XMinioWriteQuorum":
+		// Set retry-after header to indicate user-agents to retry request after 120secs.
+		// https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Retry-After
+		w.Header().Set("Retry-After", "120")
+	case "AccessDenied":
+		// The request is from browser and also if browser
+		// is enabled we need to redirect.
+		if browser {
+			w.Header().Set("Location", minioReservedBucketPath+reqURL.Path)
+			w.WriteHeader(http.StatusTemporaryRedirect)
+			return
+		}
+	}
+
+	// Generate error response.
+	errorResponse := getAPIErrorResponse(ctx, err, reqURL.Path,
+		w.Header().Get(responseRequestIDKey), w.Header().Get(responseDeploymentIDKey))
+	encodedErrorResponse := encodeResponse(errorResponse)
+	writeResponse(w, err.HTTPStatusCode, encodedErrorResponse, mimeXML)
+}
+
+func writeErrorResponseHeadersOnly(w http.ResponseWriter, err APIError) {
+	writeResponse(w, err.HTTPStatusCode, nil, mimeNone)
+}
+
+// writeErrorResponseJSON - writes error response in JSON format;
+// useful for admin APIs.
+func writeErrorResponseJSON(ctx context.Context, w http.ResponseWriter, err APIError, reqURL *url.URL) {
+	// Generate error response.
+	errorResponse := getAPIErrorResponse(ctx, err, reqURL.Path, w.Header().Get(responseRequestIDKey), w.Header().Get(responseDeploymentIDKey))
+	encodedErrorResponse := encodeResponseJSON(errorResponse)
+	writeResponse(w, err.HTTPStatusCode, encodedErrorResponse, mimeJSON)
+}
+
+// writeCustomErrorResponseJSON - similar to writeErrorResponseJSON,
+// but accepts the error message directly (this allows messages to be
+// dynamically generated.)
+func writeCustomErrorResponseJSON(ctx context.Context, w http.ResponseWriter, err APIError,
+	errBody string, reqURL *url.URL) {
+
+	reqInfo := logger.GetReqInfo(ctx)
+	errorResponse := APIErrorResponse{
+		Code:       err.Code,
+		Message:    errBody,
+		Resource:   reqURL.Path,
+		BucketName: reqInfo.BucketName,
+		Key:        reqInfo.ObjectName,
+		RequestID:  w.Header().Get(responseRequestIDKey),
+		HostID:     w.Header().Get(responseDeploymentIDKey),
+	}
+	encodedErrorResponse := encodeResponseJSON(errorResponse)
+	writeResponse(w, err.HTTPStatusCode, encodedErrorResponse, mimeJSON)
+}
+
+// writeCustomErrorResponseXML - similar to writeErrorResponse,
+// but accepts the error message directly (this allows messages to be
+// dynamically generated.)
+func writeCustomErrorResponseXML(ctx context.Context, w http.ResponseWriter, err APIError, errBody string, reqURL *url.URL, browser bool) {
+
+	switch err.Code {
+	case "SlowDown", "XMinioServerNotInitialized", "XMinioReadQuorum", "XMinioWriteQuorum":
+		// Set retry-after header to indicate user-agents to retry request after 120secs.
+		// https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Retry-After
+		w.Header().Set("Retry-After", "120")
+	case "AccessDenied":
+		// The request is from browser and also if browser
+		// is enabled we need to redirect.
+		if browser && globalIsBrowserEnabled {
+			w.Header().Set("Location", minioReservedBucketPath+reqURL.Path)
+			w.WriteHeader(http.StatusTemporaryRedirect)
+			return
+		}
+	}
+
+	reqInfo := logger.GetReqInfo(ctx)
+	errorResponse := APIErrorResponse{
+		Code:       err.Code,
+		Message:    errBody,
+		Resource:   reqURL.Path,
+		BucketName: reqInfo.BucketName,
+		Key:        reqInfo.ObjectName,
+		RequestID:  w.Header().Get(responseRequestIDKey),
+		HostID:     w.Header().Get(responseDeploymentIDKey),
+	}
+
+	encodedErrorResponse := encodeResponse(errorResponse)
+	writeResponse(w, err.HTTPStatusCode, encodedErrorResponse, mimeXML)
 }

@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2016 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2016 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -33,15 +34,27 @@ func TestReadDirFail(t *testing.T) {
 		t.Fatalf("expected = %s, got: %s", errFileNotFound, err)
 	}
 
+	file := path.Join(os.TempDir(), "issue")
+	if err := ioutil.WriteFile(file, []byte(""), 0644); err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(file)
+
 	// Check if file is given.
-	if _, err := readDir("/etc/issue/mydir"); err != errFileNotFound {
+	if _, err := readDir(path.Join(file, "mydir")); err != errFileNotFound {
 		t.Fatalf("expected = %s, got: %s", errFileNotFound, err)
 	}
 
 	// Only valid for linux.
 	if runtime.GOOS == "linux" {
+		permDir := path.Join(os.TempDir(), "perm-dir")
+		if err := os.MkdirAll(permDir, os.FileMode(0200)); err != nil {
+			t.Fatal(err)
+		}
+		defer os.RemoveAll(permDir)
+
 		// Check if permission denied.
-		if _, err := readDir("/proc/1/fd"); err == nil {
+		if _, err := readDir(permDir); err == nil {
 			t.Fatalf("expected = an error, got: nil")
 		}
 	}
@@ -55,7 +68,7 @@ type result struct {
 
 func mustSetupDir(t *testing.T) string {
 	// Create unique test directory.
-	dir, err := ioutil.TempDir("", "minio-posix-list-dir")
+	dir, err := ioutil.TempDir(globalTestTmpDir, "minio-posix-list-dir")
 	if err != nil {
 		t.Fatalf("Unable to setup directory, %s", err)
 	}
@@ -66,26 +79,6 @@ func mustSetupDir(t *testing.T) string {
 func setupTestReadDirEmpty(t *testing.T) (testResults []result) {
 	// Add empty entry slice for this test directory.
 	testResults = append(testResults, result{mustSetupDir(t), []string{}})
-	return testResults
-}
-
-// Test to read empty directory with only reserved names.
-func setupTestReadDirReserved(t *testing.T) (testResults []result) {
-	dir := mustSetupDir(t)
-	entries := []string{}
-	// Create a file with reserved name.
-	for _, reservedName := range posixReservedPrefix {
-		if err := ioutil.WriteFile(filepath.Join(dir, reservedName), []byte{}, os.ModePerm); err != nil {
-			// For cleanup, its required to add these entries into test results.
-			testResults = append(testResults, result{dir, entries})
-			t.Fatalf("Unable to create file, %s", err)
-		}
-		// entries = append(entries, reservedName) - reserved files are skipped.
-	}
-	sort.Strings(entries)
-
-	// Add entries slice for this test directory.
-	testResults = append(testResults, result{dir, entries})
 	return testResults
 }
 
@@ -198,8 +191,6 @@ func TestReadDir(t *testing.T) {
 
 	// Setup and capture test results for empty directory.
 	testResults = append(testResults, setupTestReadDirEmpty(t)...)
-	// Setup and capture test results for reserved files.
-	testResults = append(testResults, setupTestReadDirReserved(t)...)
 	// Setup and capture test results for directory with only files.
 	testResults = append(testResults, setupTestReadDirFiles(t)...)
 	// Setup and capture test results for directory with files and directories.
@@ -220,6 +211,44 @@ func TestReadDir(t *testing.T) {
 			if !checkResult(r.entries, entries) {
 				t.Fatalf("expected = %s, got: %s", r.entries, entries)
 			}
+		}
+	}
+}
+
+func TestReadDirN(t *testing.T) {
+	testCases := []struct {
+		numFiles    int
+		n           int
+		expectedNum int
+	}{
+		{0, 0, 0},
+		{0, 1, 0},
+		{1, 0, 1},
+		{0, -1, 0},
+		{1, -1, 1},
+		{10, -1, 10},
+		{1, 1, 1},
+		{2, 1, 1},
+		{10, 9, 9},
+		{10, 10, 10},
+		{10, 11, 10},
+	}
+
+	for i, testCase := range testCases {
+		dir := mustSetupDir(t)
+		defer os.RemoveAll(dir)
+
+		for c := 1; c <= testCase.numFiles; c++ {
+			if err := ioutil.WriteFile(filepath.Join(dir, fmt.Sprintf("%d", c)), []byte{}, os.ModePerm); err != nil {
+				t.Fatalf("Unable to create a file, %s", err)
+			}
+		}
+		entries, err := readDirN(dir, testCase.n)
+		if err != nil {
+			t.Fatalf("Unable to read entries, %s", err)
+		}
+		if len(entries) != testCase.expectedNum {
+			t.Fatalf("Test %d: unexpected number of entries, waiting for %d, but found %d", i+1, testCase.expectedNum, len(entries))
 		}
 	}
 }

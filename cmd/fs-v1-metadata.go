@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2016 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2016, 2017, 2017 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,158 +17,273 @@
 package cmd
 
 import (
+	"context"
+	"encoding/hex"
 	"encoding/json"
+	"io"
+	"io/ioutil"
+	"net/http"
 	"os"
-	"path"
-	"sort"
-	"strings"
+	pathutil "path"
+	"time"
+
+	"github.com/minio/minio/cmd/logger"
+	"github.com/minio/minio/pkg/lock"
+	"github.com/minio/minio/pkg/mimedb"
+	"github.com/tidwall/gjson"
 )
 
+// FS format, and object metadata.
 const (
-	fsMetaJSONFile   = "fs.json"
-	fsFormatJSONFile = "format.json"
+	// fs.json object metadata.
+	fsMetaJSONFile = "fs.json"
 )
+
+// FS metadata constants.
+const (
+	// FS backend meta 1.0.0 version.
+	fsMetaVersion100 = "1.0.0"
+
+	// FS backend meta 1.0.1 version.
+	fsMetaVersion101 = "1.0.1"
+
+	// FS backend meta 1.0.2
+	// Removed the fields "Format" and "MinIO" from fsMetaV1 as they were unused. Added "Checksum" field - to be used in future for bit-rot protection.
+	fsMetaVersion = "1.0.2"
+
+	// Add more constants here.
+)
+
+// FSChecksumInfoV1 - carries checksums of individual blocks on disk.
+type FSChecksumInfoV1 struct {
+	Algorithm string
+	Blocksize int64
+	Hashes    [][]byte
+}
+
+// MarshalJSON marshals the FSChecksumInfoV1 struct
+func (c FSChecksumInfoV1) MarshalJSON() ([]byte, error) {
+	type checksuminfo struct {
+		Algorithm string   `json:"algorithm"`
+		Blocksize int64    `json:"blocksize"`
+		Hashes    []string `json:"hashes"`
+	}
+	var hashes []string
+	for _, h := range c.Hashes {
+		hashes = append(hashes, hex.EncodeToString(h))
+	}
+	info := checksuminfo{
+		Algorithm: c.Algorithm,
+		Hashes:    hashes,
+		Blocksize: c.Blocksize,
+	}
+	return json.Marshal(info)
+}
+
+// UnmarshalJSON unmarshals the the given data into the FSChecksumInfoV1 struct
+func (c *FSChecksumInfoV1) UnmarshalJSON(data []byte) error {
+	type checksuminfo struct {
+		Algorithm string   `json:"algorithm"`
+		Blocksize int64    `json:"blocksize"`
+		Hashes    []string `json:"hashes"`
+	}
+
+	var info checksuminfo
+	err := json.Unmarshal(data, &info)
+	if err != nil {
+		return err
+	}
+	c.Algorithm = info.Algorithm
+	c.Blocksize = info.Blocksize
+	var hashes [][]byte
+	for _, hashStr := range info.Hashes {
+		h, err := hex.DecodeString(hashStr)
+		if err != nil {
+			return err
+		}
+		hashes = append(hashes, h)
+	}
+	c.Hashes = hashes
+	return nil
+}
 
 // A fsMetaV1 represents a metadata header mapping keys to sets of values.
 type fsMetaV1 struct {
 	Version string `json:"version"`
-	Format  string `json:"format"`
-	Minio   struct {
-		Release string `json:"release"`
-	} `json:"minio"`
-	// Metadata map for current object `fs.json`.
-	Meta  map[string]string `json:"meta,omitempty"`
-	Parts []objectPartInfo  `json:"parts,omitempty"`
+	// checksums of blocks on disk.
+	Checksum FSChecksumInfoV1 `json:"checksum,omitempty"`
+	// Metadata map for current object.
+	Meta map[string]string `json:"meta,omitempty"`
+	// parts info for current object - used in encryption.
+	Parts []ObjectPartInfo `json:"parts,omitempty"`
 }
 
-// ObjectPartIndex - returns the index of matching object part number.
-func (m fsMetaV1) ObjectPartIndex(partNumber int) (partIndex int) {
-	for i, part := range m.Parts {
-		if partNumber == part.Number {
-			partIndex = i
-			return partIndex
+// IsValid - tells if the format is sane by validating the version
+// string and format style.
+func (m fsMetaV1) IsValid() bool {
+	return isFSMetaValid(m.Version)
+}
+
+// Verifies if the backend format metadata is same by validating
+// the version string.
+func isFSMetaValid(version string) bool {
+	return (version == fsMetaVersion || version == fsMetaVersion100 || version == fsMetaVersion101)
+}
+
+// Converts metadata to object info.
+func (m fsMetaV1) ToObjectInfo(bucket, object string, fi os.FileInfo) ObjectInfo {
+	if len(m.Meta) == 0 {
+		m.Meta = make(map[string]string)
+	}
+
+	// Guess content-type from the extension if possible.
+	if m.Meta["content-type"] == "" {
+		m.Meta["content-type"] = mimedb.TypeByExtension(pathutil.Ext(object))
+	}
+
+	if hasSuffix(object, slashSeparator) {
+		m.Meta["etag"] = emptyETag // For directories etag is d41d8cd98f00b204e9800998ecf8427e
+		m.Meta["content-type"] = "application/octet-stream"
+	}
+
+	objInfo := ObjectInfo{
+		Bucket: bucket,
+		Name:   object,
+	}
+
+	// We set file info only if its valid.
+	objInfo.ModTime = timeSentinel
+	if fi != nil {
+		objInfo.ModTime = fi.ModTime()
+		objInfo.Size = fi.Size()
+		if fi.IsDir() {
+			// Directory is always 0 bytes in S3 API, treat it as such.
+			objInfo.Size = 0
+			objInfo.IsDir = fi.IsDir()
 		}
 	}
-	return -1
-}
 
-// AddObjectPart - add a new object part in order.
-func (m *fsMetaV1) AddObjectPart(partNumber int, partName string, partETag string, partSize int64) {
-	partInfo := objectPartInfo{
-		Number: partNumber,
-		Name:   partName,
-		ETag:   partETag,
-		Size:   partSize,
+	objInfo.ETag = extractETag(m.Meta)
+	objInfo.ContentType = m.Meta["content-type"]
+	objInfo.ContentEncoding = m.Meta["content-encoding"]
+	if storageClass, ok := m.Meta[amzStorageClass]; ok {
+		objInfo.StorageClass = storageClass
+	} else {
+		objInfo.StorageClass = globalMinioDefaultStorageClass
 	}
-
-	// Update part info if it already exists.
-	for i, part := range m.Parts {
-		if partNumber == part.Number {
-			m.Parts[i] = partInfo
-			return
+	var (
+		t time.Time
+		e error
+	)
+	if exp, ok := m.Meta["expires"]; ok {
+		if t, e = time.Parse(http.TimeFormat, exp); e == nil {
+			objInfo.Expires = t.UTC()
 		}
 	}
+	// etag/md5Sum has already been extracted. We need to
+	// remove to avoid it from appearing as part of
+	// response headers. e.g, X-Minio-* or X-Amz-*.
+	objInfo.UserDefined = cleanMetadata(m.Meta)
 
-	// Proceed to include new part info.
-	m.Parts = append(m.Parts, partInfo)
+	// All the parts per object.
+	objInfo.Parts = m.Parts
 
-	// Parts in fsMeta should be in sorted order by part number.
-	sort.Sort(byObjectPartNumber(m.Parts))
+	// Success..
+	return objInfo
 }
 
-// readFSMetadata - returns the object metadata `fs.json` content.
-func readFSMetadata(disk StorageAPI, bucket, object string) (fsMeta fsMetaV1, err error) {
-	// Read all `fs.json`.
-	buf, err := disk.ReadAll(bucket, path.Join(object, fsMetaJSONFile))
+func (m *fsMetaV1) WriteTo(lk *lock.LockedFile) (n int64, err error) {
+	if err = jsonSave(lk, m); err != nil {
+		return 0, err
+	}
+	fi, err := lk.Stat()
 	if err != nil {
-		return fsMetaV1{}, err
+		return 0, err
+	}
+	return fi.Size(), nil
+}
+
+func parseFSVersion(fsMetaBuf []byte) string {
+	return gjson.GetBytes(fsMetaBuf, "version").String()
+}
+
+func parseFSMetaMap(fsMetaBuf []byte) map[string]string {
+	// Get xlMetaV1.Meta map.
+	metaMapResult := gjson.GetBytes(fsMetaBuf, "meta").Map()
+	metaMap := make(map[string]string)
+	for key, valResult := range metaMapResult {
+		metaMap[key] = valResult.String()
+	}
+	return metaMap
+}
+
+func parseFSPartsArray(fsMetaBuf []byte) []ObjectPartInfo {
+	// Get xlMetaV1.Parts array
+	var partsArray []ObjectPartInfo
+
+	partsArrayResult := gjson.GetBytes(fsMetaBuf, "parts")
+	partsArrayResult.ForEach(func(key, part gjson.Result) bool {
+		partJSON := part.String()
+		number := gjson.Get(partJSON, "number").Int()
+		name := gjson.Get(partJSON, "name").String()
+		etag := gjson.Get(partJSON, "etag").String()
+		size := gjson.Get(partJSON, "size").Int()
+		actualSize := gjson.Get(partJSON, "actualSize").Int()
+		partsArray = append(partsArray, ObjectPartInfo{
+			Number:     int(number),
+			Name:       name,
+			ETag:       etag,
+			Size:       size,
+			ActualSize: int64(actualSize),
+		})
+		return true
+	})
+	return partsArray
+}
+
+func (m *fsMetaV1) ReadFrom(ctx context.Context, lk *lock.LockedFile) (n int64, err error) {
+	var fsMetaBuf []byte
+	fi, err := lk.Stat()
+	if err != nil {
+		logger.LogIf(ctx, err)
+		return 0, err
 	}
 
-	// Decode `fs.json` into fsMeta structure.
-	if err = json.Unmarshal(buf, &fsMeta); err != nil {
-		return fsMetaV1{}, err
+	fsMetaBuf, err = ioutil.ReadAll(io.NewSectionReader(lk, 0, fi.Size()))
+	if err != nil {
+		logger.LogIf(ctx, err)
+		return 0, err
 	}
+
+	if len(fsMetaBuf) == 0 {
+		logger.LogIf(ctx, io.EOF)
+		return 0, io.EOF
+	}
+
+	// obtain version.
+	m.Version = parseFSVersion(fsMetaBuf)
+
+	// Verify if the format is valid, return corrupted format
+	// for unrecognized formats.
+	if !isFSMetaValid(m.Version) {
+		logger.GetReqInfo(ctx).AppendTags("file", lk.Name())
+		logger.LogIf(ctx, errCorruptedFormat)
+		return 0, errCorruptedFormat
+	}
+
+	// obtain parts information
+	m.Parts = parseFSPartsArray(fsMetaBuf)
+
+	// obtain metadata.
+	m.Meta = parseFSMetaMap(fsMetaBuf)
 
 	// Success.
-	return fsMeta, nil
+	return int64(len(fsMetaBuf)), nil
 }
 
 // newFSMetaV1 - initializes new fsMetaV1.
 func newFSMetaV1() (fsMeta fsMetaV1) {
 	fsMeta = fsMetaV1{}
-	fsMeta.Version = "1.0.0"
-	fsMeta.Format = "fs"
-	fsMeta.Minio.Release = ReleaseTag
+	fsMeta.Version = fsMetaVersion
 	return fsMeta
-}
-
-// newFSFormatV1 - initializes new formatConfigV1 with FS format info.
-func newFSFormatV1() (format formatConfigV1) {
-	return formatConfigV1{
-		Version: "1",
-		Format:  "fs",
-		FS: &fsFormat{
-			Version: "1",
-		},
-	}
-}
-
-// isFSFormat - returns whether given formatConfigV1 is FS type or not.
-func isFSFormat(format formatConfigV1) bool {
-	return format.Format == "fs"
-}
-
-// writes FS format (format.json) into minioMetaBucket.
-func writeFSFormatData(storage StorageAPI, fsFormat formatConfigV1) error {
-	metadataBytes, err := json.Marshal(fsFormat)
-	if err != nil {
-		return err
-	}
-	// fsFormatJSONFile - format.json file stored in minioMetaBucket(.minio) directory.
-	if err = storage.AppendFile(minioMetaBucket, fsFormatJSONFile, metadataBytes); err != nil {
-		return err
-	}
-	return nil
-}
-
-// writeFSMetadata - writes `fs.json` metadata, marshals fsMeta object into json
-// and saves it to disk.
-func writeFSMetadata(storage StorageAPI, bucket, path string, fsMeta fsMetaV1) error {
-	metadataBytes, err := json.Marshal(fsMeta)
-	if err != nil {
-		return err
-	}
-	if err = storage.AppendFile(bucket, path, metadataBytes); err != nil {
-		return err
-	}
-	return nil
-}
-
-var extendedHeaders = []string{
-	"X-Amz-Meta-",
-	"X-Minio-Meta-",
-	// Add new extended headers.
-}
-
-// isExtendedHeader validates if input string matches extended headers.
-func isExtendedHeader(header string) bool {
-	for _, extendedHeader := range extendedHeaders {
-		if strings.HasPrefix(header, extendedHeader) {
-			return true
-		}
-	}
-	return false
-}
-
-// Return true if extended HTTP headers are set, false otherwise.
-func hasExtendedHeader(metadata map[string]string) bool {
-	if os.Getenv("MINIO_ENABLE_FSMETA") == "1" {
-		return true
-	}
-	for k := range metadata {
-		if isExtendedHeader(k) {
-			return true
-		}
-	}
-	return false
 }

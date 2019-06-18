@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2016 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2016, 2018 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,17 +18,11 @@ package cmd
 
 import "errors"
 
-// errXLMaxDisks - returned for reached maximum of disks.
-var errXLMaxDisks = errors.New("Number of disks are higher than supported maximum count '16'")
-
-// errXLMinDisks - returned for minimum number of disks.
-var errXLMinDisks = errors.New("Minimum '4' disks are required to enable erasure code")
-
-// errXLNumDisks - returned for odd number of disks.
-var errXLNumDisks = errors.New("Total number of disks should be multiples of '2'")
-
 // errXLReadQuorum - did not meet read quorum.
 var errXLReadQuorum = errors.New("Read failed. Insufficient number of disks online")
 
 // errXLWriteQuorum - did not meet write quorum.
 var errXLWriteQuorum = errors.New("Write failed. Insufficient number of disks online")
+
+// errNoHealRequired - returned when healing is attempted on a previously healed disks.
+var errNoHealRequired = errors.New("No healing is required")

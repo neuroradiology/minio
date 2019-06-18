@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2016 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2016, 2017 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -81,13 +81,13 @@ func validateCredentialfields(t *testing.T, testNum int, expectedCredentials cre
 // A valid format of creadential should be of the following format.
 // Credential = accessKey + "/"+ scope
 // where scope = string.Join([]string{  currTime.Format(yyyymmdd),
-// 			"us-east-1",
+// 			globalMinioDefaultRegion,
 //               	"s3",
 //		        "aws4_request",
 //                       },"/")
 func TestParseCredentialHeader(t *testing.T) {
 
-	sampleTimeStr := time.Now().UTC().Format(yyyymmdd)
+	sampleTimeStr := UTCNow().Format(yyyymmdd)
 
 	testCases := []struct {
 		inputCredentialStr  string
@@ -116,11 +116,11 @@ func TestParseCredentialHeader(t *testing.T) {
 			expectedErrCode:     ErrCredMalformed,
 		},
 		// Test Case - 4.
-		// Test case with malformed AccessKey.
+		// Test case with AccessKey of length 2.
 		{
 			inputCredentialStr: generateCredentialStr(
-				"^#@..!23",
-				time.Now().UTC().Format(yyyymmdd),
+				"^#",
+				UTCNow().Format(yyyymmdd),
 				"ABCD",
 				"ABCD",
 				"ABCD"),
@@ -133,7 +133,7 @@ func TestParseCredentialHeader(t *testing.T) {
 		{
 			inputCredentialStr: generateCredentialStr(
 				"Z7IXGOO6BZ0REAN1Q26I",
-				time.Now().UTC().String(),
+				UTCNow().String(),
 				"ABCD",
 				"ABCD",
 				"ABCD"),
@@ -141,30 +141,29 @@ func TestParseCredentialHeader(t *testing.T) {
 			expectedErrCode:     ErrMalformedCredentialDate,
 		},
 		// Test Case - 6.
-		// Test case with invalid region.
-		// region should a non empty string.
-		{
-			inputCredentialStr: generateCredentialStr(
-				"Z7IXGOO6BZ0REAN1Q26I",
-				time.Now().UTC().Format(yyyymmdd),
-				"",
-				"ABCD",
-				"ABCD"),
-			expectedCredentials: credentialHeader{},
-			expectedErrCode:     ErrMalformedCredentialRegion,
-		},
-		// Test Case - 7.
 		// Test case with invalid service.
 		// "s3" is the valid service string.
 		{
 			inputCredentialStr: generateCredentialStr(
 				"Z7IXGOO6BZ0REAN1Q26I",
-				time.Now().UTC().Format(yyyymmdd),
+				UTCNow().Format(yyyymmdd),
 				"us-west-1",
 				"ABCD",
 				"ABCD"),
 			expectedCredentials: credentialHeader{},
 			expectedErrCode:     ErrInvalidService,
+		},
+		// Test Case - 7.
+		// Test case with invalid region.
+		{
+			inputCredentialStr: generateCredentialStr(
+				"Z7IXGOO6BZ0REAN1Q26I",
+				UTCNow().Format(yyyymmdd),
+				"us-west-2",
+				"s3",
+				"aws4_request"),
+			expectedCredentials: credentialHeader{},
+			expectedErrCode:     ErrAuthorizationHeaderMalformed,
 		},
 		// Test Case - 8.
 		// Test case with invalid request version.
@@ -172,7 +171,7 @@ func TestParseCredentialHeader(t *testing.T) {
 		{
 			inputCredentialStr: generateCredentialStr(
 				"Z7IXGOO6BZ0REAN1Q26I",
-				time.Now().UTC().Format(yyyymmdd),
+				UTCNow().Format(yyyymmdd),
 				"us-west-1",
 				"s3",
 				"ABCD"),
@@ -198,13 +197,51 @@ func TestParseCredentialHeader(t *testing.T) {
 				"aws4_request"),
 			expectedErrCode: ErrNone,
 		},
+		// Test Case - 10.
+		// Test case with right inputs -> AccessKey contains `/`. See minio/#6443
+		// "aws4_request" is the valid request version.
+		{
+			inputCredentialStr: generateCredentialStr(
+				"LOCALKEY/DEV/1",
+				sampleTimeStr,
+				"us-west-1",
+				"s3",
+				"aws4_request"),
+			expectedCredentials: generateCredentials(
+				t,
+				"LOCALKEY/DEV/1",
+				sampleTimeStr,
+				"us-west-1",
+				"s3",
+				"aws4_request"),
+			expectedErrCode: ErrNone,
+		},
+		// Test Case - 11.
+		// Test case with right inputs -> AccessKey contains `=`. See minio/#7376
+		// "aws4_request" is the valid request version.
+		{
+			inputCredentialStr: generateCredentialStr(
+				"LOCALKEY/DEV/1=",
+				sampleTimeStr,
+				"us-west-1",
+				"s3",
+				"aws4_request"),
+			expectedCredentials: generateCredentials(
+				t,
+				"LOCALKEY/DEV/1=",
+				sampleTimeStr,
+				"us-west-1",
+				"s3",
+				"aws4_request"),
+			expectedErrCode: ErrNone,
+		},
 	}
 
 	for i, testCase := range testCases {
-		actualCredential, actualErrCode := parseCredentialHeader(testCase.inputCredentialStr)
+		actualCredential, actualErrCode := parseCredentialHeader(testCase.inputCredentialStr, "us-west-1", "s3")
 		// validating the credential fields.
 		if testCase.expectedErrCode != actualErrCode {
-			t.Fatalf("Test %d: Expected the APIErrCode to be %d, got %d", i+1, testCase.expectedErrCode, actualErrCode)
+			t.Fatalf("Test %d: Expected the APIErrCode to be %s, got %s", i+1, errorCodes[testCase.expectedErrCode].Code, errorCodes[actualErrCode].Code)
 		}
 		if actualErrCode == ErrNone {
 			validateCredentialfields(t, i+1, testCase.expectedCredentials, actualCredential)
@@ -228,13 +265,21 @@ func TestParseSignature(t *testing.T) {
 			expectedErrCode:  ErrMissingFields,
 		},
 		// Test case - 2.
+		// SignElement does have 2 parts but doesn't have valid signature value.
+		// ErrMissingFields expected.
+		{
+			inputSignElement: "Signature=",
+			expectedSignStr:  "",
+			expectedErrCode:  ErrMissingFields,
+		},
+		// Test case - 3.
 		// SignElemenet with missing "SignatureTag",ErrMissingSignTag expected.
 		{
 			inputSignElement: "Sign=",
 			expectedSignStr:  "",
 			expectedErrCode:  ErrMissingSignTag,
 		},
-		// Test case - 3.
+		// Test case - 4.
 		// Test case with valid inputs.
 		{
 			inputSignElement: "Signature=abcd",
@@ -289,8 +334,7 @@ func TestParseSignedHeaders(t *testing.T) {
 	}
 
 	for i, testCase := range testCases {
-		actualSignedHeaders, actualErrCode := parseSignedHeaders(testCase.inputSignElement)
-
+		actualSignedHeaders, actualErrCode := parseSignedHeader(testCase.inputSignElement)
 		if testCase.expectedErrCode != actualErrCode {
 			t.Errorf("Test %d: Expected the APIErrCode to be %d, got %d", i+1, testCase.expectedErrCode, actualErrCode)
 		}
@@ -306,7 +350,7 @@ func TestParseSignedHeaders(t *testing.T) {
 
 // TestParseSignV4 - Tests Parsing of v4 signature form the authorization string.
 func TestParseSignV4(t *testing.T) {
-	sampleTimeStr := time.Now().UTC().Format(yyyymmdd)
+	sampleTimeStr := UTCNow().Format(yyyymmdd)
 	testCases := []struct {
 		inputV4AuthStr    string
 		expectedAuthField signValues
@@ -405,7 +449,6 @@ func TestParseSignV4(t *testing.T) {
 					// a valid signature is of form "Signature="
 					"Signature=abcd",
 				}, ","),
-
 			expectedAuthField: signValues{
 				Credential: generateCredentials(
 					t,
@@ -422,7 +465,7 @@ func TestParseSignV4(t *testing.T) {
 	}
 
 	for i, testCase := range testCases {
-		parsedAuthField, actualErrCode := parseSignV4(testCase.inputV4AuthStr)
+		parsedAuthField, actualErrCode := parseSignV4(testCase.inputV4AuthStr, "", "s3")
 
 		if testCase.expectedErrCode != actualErrCode {
 			t.Fatalf("Test %d: Expected the APIErrCode to be %d, got %d", i+1, testCase.expectedErrCode, actualErrCode)
@@ -433,7 +476,7 @@ func TestParseSignV4(t *testing.T) {
 			validateCredentialfields(t, i+1, testCase.expectedAuthField.Credential, parsedAuthField.Credential)
 
 			// validating the extraction/parsing of signature field.
-			if testCase.expectedAuthField.Signature != parsedAuthField.Signature {
+			if !compareSignatureV4(testCase.expectedAuthField.Signature, parsedAuthField.Signature) {
 				t.Errorf("Test %d: Parsed Signature field mismatch: Expected \"%s\", got \"%s\"", i+1, testCase.expectedAuthField.Signature, parsedAuthField.Signature)
 			}
 
@@ -562,12 +605,12 @@ func TestDoesV4PresignParamsExist(t *testing.T) {
 func TestParsePreSignV4(t *testing.T) {
 	// converts the duration in seconds into string format.
 	getDurationStr := func(expires int) string {
-		return strconv.FormatInt(int64(expires), 10)
+		return strconv.Itoa(expires)
 	}
 	// used in expected preSignValues, preSignValues.Date is of type time.Time .
-	queryTime := time.Now()
+	queryTime := UTCNow()
 
-	sampleTimeStr := time.Now().UTC().Format(yyyymmdd)
+	sampleTimeStr := UTCNow().Format(yyyymmdd)
 
 	testCases := []struct {
 		inputQueryKeyVals     []string
@@ -661,7 +704,7 @@ func TestParsePreSignV4(t *testing.T) {
 					"s3",
 					"aws4_request"),
 				// valid "X-Amz-Date" query.
-				"X-Amz-Date", time.Now().UTC().Format(iso8601Format),
+				"X-Amz-Date", UTCNow().Format(iso8601Format),
 				"X-Amz-Expires", "MalformedExpiry",
 				"X-Amz-SignedHeaders", "",
 				"X-Amz-Signature", "",
@@ -670,6 +713,50 @@ func TestParsePreSignV4(t *testing.T) {
 			expectedErrCode:       ErrMalformedExpires,
 		},
 		// Test case - 6.
+		// Test case with negative X-Amz-Expires header.
+		{
+			inputQueryKeyVals: []string{
+				// valid  "X-Amz-Algorithm" header.
+				"X-Amz-Algorithm", signV4Algorithm,
+				// valid  "X-Amz-Credential" header.
+				"X-Amz-Credential", joinWithSlash(
+					"Z7IXGOO6BZ0REAN1Q26I",
+					sampleTimeStr,
+					"us-west-1",
+					"s3",
+					"aws4_request"),
+				// valid "X-Amz-Date" query.
+				"X-Amz-Date", queryTime.UTC().Format(iso8601Format),
+				"X-Amz-Expires", getDurationStr(-1),
+				"X-Amz-Signature", "abcd",
+				"X-Amz-SignedHeaders", "host;x-amz-content-sha256;x-amz-date",
+			},
+			expectedPreSignValues: preSignValues{},
+			expectedErrCode:       ErrNegativeExpires,
+		},
+		// Test case - 7.
+		// Test case with empty X-Amz-SignedHeaders.
+		{
+			inputQueryKeyVals: []string{
+				// valid  "X-Amz-Algorithm" header.
+				"X-Amz-Algorithm", signV4Algorithm,
+				// valid  "X-Amz-Credential" header.
+				"X-Amz-Credential", joinWithSlash(
+					"Z7IXGOO6BZ0REAN1Q26I",
+					sampleTimeStr,
+					"us-west-1",
+					"s3",
+					"aws4_request"),
+				// valid "X-Amz-Date" query.
+				"X-Amz-Date", queryTime.UTC().Format(iso8601Format),
+				"X-Amz-Expires", getDurationStr(100),
+				"X-Amz-Signature", "abcd",
+				"X-Amz-SignedHeaders", "",
+			},
+			expectedPreSignValues: preSignValues{},
+			expectedErrCode:       ErrMissingFields,
+		},
+		// Test case - 8.
 		// Test case with valid "X-Amz-Algorithm", "X-Amz-Credential", "X-Amz-Date" query value.
 		// Malformed Expiry, a valid expiry should be of format "<int>s".
 		{
@@ -712,6 +799,30 @@ func TestParsePreSignV4(t *testing.T) {
 			},
 			expectedErrCode: ErrNone,
 		},
+
+		// Test case - 9.
+		// Test case with value greater than 604800 in X-Amz-Expires header.
+		{
+			inputQueryKeyVals: []string{
+				// valid  "X-Amz-Algorithm" header.
+				"X-Amz-Algorithm", signV4Algorithm,
+				// valid  "X-Amz-Credential" header.
+				"X-Amz-Credential", joinWithSlash(
+					"Z7IXGOO6BZ0REAN1Q26I",
+					sampleTimeStr,
+					"us-west-1",
+					"s3",
+					"aws4_request"),
+				// valid "X-Amz-Date" query.
+				"X-Amz-Date", queryTime.UTC().Format(iso8601Format),
+				// Invalid Expiry time greater than 7 days (604800 in seconds).
+				"X-Amz-Expires", getDurationStr(605000),
+				"X-Amz-Signature", "abcd",
+				"X-Amz-SignedHeaders", "host;x-amz-content-sha256;x-amz-date",
+			},
+			expectedPreSignValues: preSignValues{},
+			expectedErrCode:       ErrMaximumExpires,
+		},
 	}
 
 	for i, testCase := range testCases {
@@ -721,8 +832,7 @@ func TestParsePreSignV4(t *testing.T) {
 			inputQuery.Set(testCase.inputQueryKeyVals[j], testCase.inputQueryKeyVals[j+1])
 		}
 		// call the function under test.
-		parsedPreSign, actualErrCode := parsePreSignV4(inputQuery)
-
+		parsedPreSign, actualErrCode := parsePreSignV4(inputQuery, "", serviceS3)
 		if testCase.expectedErrCode != actualErrCode {
 			t.Fatalf("Test %d: Expected the APIErrCode to be %d, got %d", i+1, testCase.expectedErrCode, actualErrCode)
 		}
@@ -734,7 +844,7 @@ func TestParsePreSignV4(t *testing.T) {
 				t.Errorf("Test %d: Expected the result to be \"%v\", but got \"%v\". ", i+1, testCase.expectedPreSignValues.SignedHeaders, parsedPreSign.SignedHeaders)
 			}
 			// validating signature field.
-			if testCase.expectedPreSignValues.Signature != parsedPreSign.Signature {
+			if !compareSignatureV4(testCase.expectedPreSignValues.Signature, parsedPreSign.Signature) {
 				t.Errorf("Test %d: Signature field mismatch: Expected \"%s\", got \"%s\"", i+1, testCase.expectedPreSignValues.Signature, parsedPreSign.Signature)
 			}
 			// validating expiry duration.

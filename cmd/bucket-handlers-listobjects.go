@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2016 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2016 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,32 +21,36 @@ import (
 	"strings"
 
 	"github.com/gorilla/mux"
+	"github.com/minio/minio/cmd/crypto"
+	"github.com/minio/minio/cmd/logger"
+
+	"github.com/minio/minio/pkg/policy"
 )
 
 // Validate all the ListObjects query arguments, returns an APIErrorCode
 // if one of the args do not meet the required conditions.
-// Special conditions required by Minio server are as below
+// Special conditions required by MinIO server are as below
 // - delimiter if set should be equal to '/', otherwise the request is rejected.
 // - marker if set should have a common prefix with 'prefix' param, otherwise
 //   the request is rejected.
-func listObjectsValidateArgs(prefix, marker, delimiter string, maxKeys int) APIErrorCode {
+func validateListObjectsArgs(prefix, marker, delimiter, encodingType string, maxKeys int) APIErrorCode {
 	// Max keys cannot be negative.
 	if maxKeys < 0 {
 		return ErrInvalidMaxKeys
 	}
 
-	/// Minio special conditions for ListObjects.
+	if encodingType != "" {
+		// Only url encoding type is supported
+		if strings.ToLower(encodingType) != "url" {
+			return ErrInvalidEncodingMethod
+		}
+	}
+
+	/// MinIO special conditions for ListObjects.
 
 	// Verify if delimiter is anything other than '/', which we do not support.
 	if delimiter != "" && delimiter != "/" {
 		return ErrNotImplemented
-	}
-	// Marker is set validate pre-condition.
-	if marker != "" {
-		// Marker not common with prefix is not implemented.
-		if !strings.HasPrefix(marker, prefix) {
-			return ErrNotImplemented
-		}
 	}
 	// Success.
 	return ErrNone
@@ -59,58 +63,81 @@ func listObjectsValidateArgs(prefix, marker, delimiter string, maxKeys int) APIE
 // criteria to return a subset of the objects in a bucket.
 //
 // NOTE: It is recommended that this API to be used for application development.
-// Minio continues to support ListObjectsV1 for supporting legacy tools.
+// MinIO continues to support ListObjectsV1 for supporting legacy tools.
 func (api objectAPIHandlers) ListObjectsV2Handler(w http.ResponseWriter, r *http.Request) {
+	ctx := newContext(r, w, "ListObjectsV2")
+
+	defer logger.AuditLog(w, r, "ListObjectsV2", mustGetClaimsFromToken(r))
+
 	vars := mux.Vars(r)
 	bucket := vars["bucket"]
 
-	switch getRequestAuthType(r) {
-	default:
-		// For all unknown auth types return error.
-		writeErrorResponse(w, r, ErrAccessDenied, r.URL.Path)
+	objectAPI := api.ObjectAPI()
+	if objectAPI == nil {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrServerNotInitialized), r.URL, guessIsBrowserReq(r))
 		return
-	case authTypeAnonymous:
-		// http://docs.aws.amazon.com/AmazonS3/latest/dev/using-with-s3-actions.html
-		if s3Error := enforceBucketPolicy(bucket, "s3:ListBucket", r.URL); s3Error != ErrNone {
-			writeErrorResponse(w, r, s3Error, r.URL.Path)
-			return
-		}
-	case authTypeSigned, authTypePresigned:
-		if s3Error := isReqAuthenticated(r); s3Error != ErrNone {
-			writeErrorResponse(w, r, s3Error, r.URL.Path)
-			return
-		}
 	}
-	// Extract all the listObjectsV2 query params to their native values.
-	prefix, token, startAfter, delimiter, maxKeys, _ := getListObjectsV2Args(r.URL.Query())
 
-	// In ListObjectsV2 'continuation-token' is the marker.
-	marker := token
-	// Check if 'continuation-token' is empty.
-	if token == "" {
-		// Then we need to use 'start-after' as marker instead.
-		marker = startAfter
-	}
-	// Validate all the query params before beginning to serve the request.
-	if s3Error := listObjectsValidateArgs(prefix, marker, delimiter, maxKeys); s3Error != ErrNone {
-		writeErrorResponse(w, r, s3Error, r.URL.Path)
+	if s3Error := checkRequestAuthType(ctx, r, policy.ListBucketAction, bucket, ""); s3Error != ErrNone {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL, guessIsBrowserReq(r))
 		return
+	}
+
+	urlValues := r.URL.Query()
+
+	// Extract all the listObjectsV2 query params to their native values.
+	prefix, token, startAfter, delimiter, fetchOwner, maxKeys, encodingType, errCode := getListObjectsV2Args(urlValues)
+	if errCode != ErrNone {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(errCode), r.URL, guessIsBrowserReq(r))
+		return
+	}
+
+	// Validate the query params before beginning to serve the request.
+	// fetch-owner is not validated since it is a boolean
+	if s3Error := validateListObjectsArgs(prefix, token, delimiter, encodingType, maxKeys); s3Error != ErrNone {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL, guessIsBrowserReq(r))
+		return
+	}
+
+	listObjectsV2 := objectAPI.ListObjectsV2
+	if api.CacheAPI() != nil {
+		listObjectsV2 = api.CacheAPI().ListObjectsV2
 	}
 	// Inititate a list objects operation based on the input params.
 	// On success would return back ListObjectsInfo object to be
-	// marshalled into S3 compatible XML header.
-	listObjectsInfo, err := api.ObjectAPI.ListObjects(bucket, prefix, marker, delimiter, maxKeys)
+	// marshaled into S3 compatible XML header.
+	listObjectsV2Info, err := listObjectsV2(ctx, bucket, prefix, token, delimiter, maxKeys, fetchOwner, startAfter)
 	if err != nil {
-		errorIf(err, "Unable to list objects.")
-		writeErrorResponse(w, r, toAPIErrorCode(err), r.URL.Path)
+		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL, guessIsBrowserReq(r))
 		return
 	}
 
-	response := generateListObjectsV2Response(bucket, prefix, token, startAfter, delimiter, maxKeys, listObjectsInfo)
-	// Write headers
-	setCommonHeaders(w)
+	for i := range listObjectsV2Info.Objects {
+		var actualSize int64
+		if listObjectsV2Info.Objects[i].IsCompressed() {
+			// Read the decompressed size from the meta.json.
+			actualSize = listObjectsV2Info.Objects[i].GetActualSize()
+			if actualSize < 0 {
+				writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrInvalidDecompressedSize), r.URL, guessIsBrowserReq(r))
+				return
+			}
+			// Set the info.Size to the actualSize.
+			listObjectsV2Info.Objects[i].Size = actualSize
+		} else if crypto.IsEncrypted(listObjectsV2Info.Objects[i].UserDefined) {
+			listObjectsV2Info.Objects[i].ETag = getDecryptedETag(r.Header, listObjectsV2Info.Objects[i], false)
+			listObjectsV2Info.Objects[i].Size, err = listObjectsV2Info.Objects[i].DecryptedSize()
+			if err != nil {
+				writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL, guessIsBrowserReq(r))
+				return
+			}
+		}
+	}
+
+	response := generateListObjectsV2Response(bucket, prefix, token, listObjectsV2Info.NextContinuationToken, startAfter,
+		delimiter, encodingType, fetchOwner, listObjectsV2Info.IsTruncated, maxKeys, listObjectsV2Info.Objects, listObjectsV2Info.Prefixes)
+
 	// Write success response.
-	writeSuccessResponse(w, encodeResponse(response))
+	writeSuccessResponseXML(w, encodeResponse(response))
 }
 
 // ListObjectsV1Handler - GET Bucket (List Objects) Version 1.
@@ -120,48 +147,73 @@ func (api objectAPIHandlers) ListObjectsV2Handler(w http.ResponseWriter, r *http
 // criteria to return a subset of the objects in a bucket.
 //
 func (api objectAPIHandlers) ListObjectsV1Handler(w http.ResponseWriter, r *http.Request) {
+	ctx := newContext(r, w, "ListObjectsV1")
+
+	defer logger.AuditLog(w, r, "ListObjectsV1", mustGetClaimsFromToken(r))
+
 	vars := mux.Vars(r)
 	bucket := vars["bucket"]
 
-	switch getRequestAuthType(r) {
-	default:
-		// For all unknown auth types return error.
-		writeErrorResponse(w, r, ErrAccessDenied, r.URL.Path)
+	objectAPI := api.ObjectAPI()
+	if objectAPI == nil {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrServerNotInitialized), r.URL, guessIsBrowserReq(r))
 		return
-	case authTypeAnonymous:
-		// http://docs.aws.amazon.com/AmazonS3/latest/dev/using-with-s3-actions.html
-		if s3Error := enforceBucketPolicy(bucket, "s3:ListBucket", r.URL); s3Error != ErrNone {
-			writeErrorResponse(w, r, s3Error, r.URL.Path)
-			return
-		}
-	case authTypeSigned, authTypePresigned:
-		if s3Error := isReqAuthenticated(r); s3Error != ErrNone {
-			writeErrorResponse(w, r, s3Error, r.URL.Path)
-			return
-		}
+	}
+
+	if s3Error := checkRequestAuthType(ctx, r, policy.ListBucketAction, bucket, ""); s3Error != ErrNone {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL, guessIsBrowserReq(r))
+		return
 	}
 
 	// Extract all the litsObjectsV1 query params to their native values.
-	prefix, marker, delimiter, maxKeys, _ := getListObjectsV1Args(r.URL.Query())
+	prefix, marker, delimiter, maxKeys, encodingType, s3Error := getListObjectsV1Args(r.URL.Query())
+	if s3Error != ErrNone {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL, guessIsBrowserReq(r))
+		return
+	}
 
 	// Validate all the query params before beginning to serve the request.
-	if s3Error := listObjectsValidateArgs(prefix, marker, delimiter, maxKeys); s3Error != ErrNone {
-		writeErrorResponse(w, r, s3Error, r.URL.Path)
+	if s3Error := validateListObjectsArgs(prefix, marker, delimiter, encodingType, maxKeys); s3Error != ErrNone {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL, guessIsBrowserReq(r))
 		return
+	}
+
+	listObjects := objectAPI.ListObjects
+	if api.CacheAPI() != nil {
+		listObjects = api.CacheAPI().ListObjects
 	}
 
 	// Inititate a list objects operation based on the input params.
 	// On success would return back ListObjectsInfo object to be
-	// marshalled into S3 compatible XML header.
-	listObjectsInfo, err := api.ObjectAPI.ListObjects(bucket, prefix, marker, delimiter, maxKeys)
+	// marshaled into S3 compatible XML header.
+	listObjectsInfo, err := listObjects(ctx, bucket, prefix, marker, delimiter, maxKeys)
 	if err != nil {
-		errorIf(err, "Unable to list objects.")
-		writeErrorResponse(w, r, toAPIErrorCode(err), r.URL.Path)
+		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL, guessIsBrowserReq(r))
 		return
 	}
-	response := generateListObjectsV1Response(bucket, prefix, marker, delimiter, maxKeys, listObjectsInfo)
-	// Write headers
-	setCommonHeaders(w)
+
+	for i := range listObjectsInfo.Objects {
+		var actualSize int64
+		if listObjectsInfo.Objects[i].IsCompressed() {
+			// Read the decompressed size from the meta.json.
+			actualSize = listObjectsInfo.Objects[i].GetActualSize()
+			if actualSize < 0 {
+				writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrInvalidDecompressedSize), r.URL, guessIsBrowserReq(r))
+				return
+			}
+			// Set the info.Size to the actualSize.
+			listObjectsInfo.Objects[i].Size = actualSize
+		} else if crypto.IsEncrypted(listObjectsInfo.Objects[i].UserDefined) {
+			listObjectsInfo.Objects[i].ETag = getDecryptedETag(r.Header, listObjectsInfo.Objects[i], false)
+			listObjectsInfo.Objects[i].Size, err = listObjectsInfo.Objects[i].DecryptedSize()
+			if err != nil {
+				writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL, guessIsBrowserReq(r))
+				return
+			}
+		}
+	}
+	response := generateListObjectsV1Response(bucket, prefix, marker, delimiter, encodingType, maxKeys, listObjectsInfo)
+
 	// Write success response.
-	writeSuccessResponse(w, encodeResponse(response))
+	writeSuccessResponseXML(w, encodeResponse(response))
 }

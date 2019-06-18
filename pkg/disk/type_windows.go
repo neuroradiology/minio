@@ -1,7 +1,7 @@
 // +build windows
 
 /*
- * Minio Cloud Storage, (C) 2015 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2015 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,11 +24,13 @@ import (
 	"unsafe"
 )
 
+var (
+	// GetVolumeInformation provides windows drive volume information.
+	GetVolumeInformation = kernel32.NewProc("GetVolumeInformationW")
+)
+
 // getFSType returns the filesystem type of the underlying mounted filesystem
 func getFSType(path string) string {
-	dll := syscall.MustLoadDLL("kernel32.dll")
-	GetVolumeInformation := dll.MustFindProc("GetVolumeInformationW")
-
 	var volumeNameSize uint32 = 260
 	var nFileSystemNameSize, lpVolumeSerialNumber uint32
 	var lpFileSystemFlags, lpMaximumComponentLength uint32

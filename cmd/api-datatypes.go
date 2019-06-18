@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2015, 2016 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2015, 2016 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,6 +20,13 @@ import (
 	"encoding/xml"
 )
 
+const (
+	// Response request id.
+	responseRequestIDKey = "x-amz-request-id"
+	// Deployment id.
+	responseDeploymentIDKey = "x-minio-deployment-id"
+)
+
 // ObjectIdentifier carries key name for the object to delete.
 type ObjectIdentifier struct {
 	ObjectName string `xml:"Key"`
@@ -28,7 +35,7 @@ type ObjectIdentifier struct {
 // createBucketConfiguration container for bucket configuration request from client.
 // Used for parsing the location from the request body for MakeBucketbucket.
 type createBucketLocationConfiguration struct {
-	XMLName  xml.Name `xml:"http://s3.amazonaws.com/doc/2006-03-01/ CreateBucketConfiguration" json:"-"`
+	XMLName  xml.Name `xml:"CreateBucketConfiguration" json:"-"`
 	Location string   `xml:"LocationConstraint"`
 }
 

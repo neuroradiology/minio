@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2016 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2016, 2017, 2018 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,253 +17,270 @@
 package cmd
 
 import (
-	"bytes"
-	"encoding/json"
 	"encoding/xml"
+	"errors"
 	"io"
 	"net/http"
-	"path"
-	"time"
 
 	"github.com/gorilla/mux"
+	"github.com/minio/minio/cmd/logger"
+	"github.com/minio/minio/pkg/event"
+	"github.com/minio/minio/pkg/event/target"
+	xnet "github.com/minio/minio/pkg/net"
+	"github.com/minio/minio/pkg/policy"
 )
 
 const (
 	bucketConfigPrefix       = "buckets"
 	bucketNotificationConfig = "notification.xml"
+	bucketListenerConfig     = "listener.json"
 )
 
-// GetBucketNotificationHandler - This implementation of the GET
-// operation uses the notification subresource to return the
-// notification configuration of a bucket. If notifications are
-// not enabled on the bucket, the operation returns an empty
-// NotificationConfiguration element.
+var errNoSuchNotifications = errors.New("The specified bucket does not have bucket notifications")
+
+// GetBucketNotificationHandler - This HTTP handler returns event notification configuration
+// as per http://docs.aws.amazon.com/AmazonS3/latest/dev/NotificationHowTo.html.
+// It returns empty configuration if its not set.
 func (api objectAPIHandlers) GetBucketNotificationHandler(w http.ResponseWriter, r *http.Request) {
-	// Validate request authorization.
-	if s3Error := checkAuth(r); s3Error != ErrNone {
-		writeErrorResponse(w, r, s3Error, r.URL.Path)
+	ctx := newContext(r, w, "GetBucketNotification")
+
+	defer logger.AuditLog(w, r, "GetBucketNotification", mustGetClaimsFromToken(r))
+
+	vars := mux.Vars(r)
+	bucketName := vars["bucket"]
+
+	objAPI := api.ObjectAPI()
+	if objAPI == nil {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrServerNotInitialized), r.URL, guessIsBrowserReq(r))
 		return
 	}
-	vars := mux.Vars(r)
-	bucket := vars["bucket"]
+
+	if !objAPI.IsNotificationSupported() {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrNotImplemented), r.URL, guessIsBrowserReq(r))
+		return
+	}
+
+	if s3Error := checkRequestAuthType(ctx, r, policy.GetBucketNotificationAction, bucketName, ""); s3Error != ErrNone {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL, guessIsBrowserReq(r))
+		return
+	}
+
+	_, err := objAPI.GetBucketInfo(ctx, bucketName)
+	if err != nil {
+		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL, guessIsBrowserReq(r))
+		return
+	}
+
 	// Attempt to successfully load notification config.
-	nConfig, err := loadNotificationConfig(bucket, api.ObjectAPI)
-	if err != nil && err != errNoSuchNotifications {
-		errorIf(err, "Unable to read notification configuration.")
-		writeErrorResponse(w, r, toAPIErrorCode(err), r.URL.Path)
-		return
-	}
-	// For no notifications we write a dummy XML.
-	if err == errNoSuchNotifications {
-		// Complies with the s3 behavior in this regard.
-		nConfig = &notificationConfig{}
-	}
-	notificationBytes, err := xml.Marshal(nConfig)
+	nConfig, err := readNotificationConfig(ctx, objAPI, bucketName)
 	if err != nil {
-		// For any marshalling failure.
-		errorIf(err, "Unable to marshal notification configuration into XML.", err)
-		writeErrorResponse(w, r, toAPIErrorCode(err), r.URL.Path)
-		return
-	}
-	// Success.
-	writeSuccessResponse(w, notificationBytes)
-}
-
-// PutBucketNotificationHandler - Minio notification feature enables
-// you to receive notifications when certain events happen in your bucket.
-// Using this API, you can replace an existing notification configuration.
-// The configuration is an XML file that defines the event types that you
-// want Minio to publish and the destination where you want Minio to publish
-// an event notification when it detects an event of the specified type.
-// By default, your bucket has no event notifications configured. That is,
-// the notification configuration will be an empty NotificationConfiguration.
-func (api objectAPIHandlers) PutBucketNotificationHandler(w http.ResponseWriter, r *http.Request) {
-	// Validate request authorization.
-	if s3Error := checkAuth(r); s3Error != ErrNone {
-		writeErrorResponse(w, r, s3Error, r.URL.Path)
-		return
-	}
-	vars := mux.Vars(r)
-	bucket := vars["bucket"]
-
-	_, err := api.ObjectAPI.GetBucketInfo(bucket)
-	if err != nil {
-		errorIf(err, "Unable to find bucket info.")
-		writeErrorResponse(w, r, toAPIErrorCode(err), r.URL.Path)
-		return
-	}
-
-	// If Content-Length is unknown or zero, deny the request. PutBucketNotification
-	// always needs a Content-Length if incoming request is not chunked.
-	if !contains(r.TransferEncoding, "chunked") {
-		if r.ContentLength == -1 {
-			writeErrorResponse(w, r, ErrMissingContentLength, r.URL.Path)
+		// Ignore errNoSuchNotifications to comply with AWS S3.
+		if err != errNoSuchNotifications {
+			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL, guessIsBrowserReq(r))
 			return
 		}
+
+		nConfig = &event.Config{}
 	}
 
-	// Reads the incoming notification configuration.
-	var buffer bytes.Buffer
-	var bufferSize int64
-	if r.ContentLength >= 0 {
-		bufferSize, err = io.CopyN(&buffer, r.Body, r.ContentLength)
-	} else {
-		bufferSize, err = io.Copy(&buffer, r.Body)
+	// If xml namespace is empty, set a default value before returning.
+	if nConfig.XMLNS == "" {
+		nConfig.XMLNS = "http://s3.amazonaws.com/doc/2006-03-01/"
 	}
+
+	notificationBytes, err := xml.Marshal(nConfig)
 	if err != nil {
-		errorIf(err, "Unable to read incoming body.")
-		writeErrorResponse(w, r, toAPIErrorCode(err), r.URL.Path)
+		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL, guessIsBrowserReq(r))
 		return
 	}
 
-	var notificationCfg notificationConfig
-	// Unmarshal notification bytes.
-	notificationConfigBytes := buffer.Bytes()
-	if err = xml.Unmarshal(notificationConfigBytes, &notificationCfg); err != nil {
-		errorIf(err, "Unable to parse notification configuration XML.")
-		writeErrorResponse(w, r, ErrMalformedXML, r.URL.Path)
-		return
-	} // Successfully marshalled notification configuration.
-
-	// Validate unmarshalled bucket notification configuration.
-	if s3Error := validateNotificationConfig(notificationCfg); s3Error != ErrNone {
-		writeErrorResponse(w, r, s3Error, r.URL.Path)
-		return
-	}
-
-	// Proceed to save notification configuration.
-	notificationConfigPath := path.Join(bucketConfigPrefix, bucket, bucketNotificationConfig)
-	_, err = api.ObjectAPI.PutObject(minioMetaBucket, notificationConfigPath, bufferSize, bytes.NewReader(buffer.Bytes()), nil)
-	if err != nil {
-		errorIf(err, "Unable to write bucket notification configuration.")
-		writeErrorResponse(w, r, toAPIErrorCode(err), r.URL.Path)
-		return
-	}
-
-	// Set bucket notification config.
-	eventN.SetBucketNotificationConfig(bucket, &notificationCfg)
-
-	// Success.
-	writeSuccessResponse(w, nil)
+	writeSuccessResponseXML(w, notificationBytes)
 }
 
-// writeNotification marshals notification message before writing to client.
-func writeNotification(w http.ResponseWriter, notification map[string][]NotificationEvent) error {
-	// Invalid response writer.
-	if w == nil {
-		return errInvalidArgument
-	}
-	// Invalid notification input.
-	if notification == nil {
-		return errInvalidArgument
-	}
-	// Marshal notification data into XML and write to client.
-	notificationBytes, err := json.Marshal(&notification)
-	if err != nil {
-		return err
-	}
-	// Add additional CRLF characters for client to
-	// differentiate the individual events properly.
-	_, err = w.Write(append(notificationBytes, crlf...))
-	// Make sure we have flushed, this would set Transfer-Encoding: chunked.
-	w.(http.Flusher).Flush()
-	if err != nil {
-		return err
-	}
-	return nil
-}
+// PutBucketNotificationHandler - This HTTP handler stores given notification configuration as per
+// http://docs.aws.amazon.com/AmazonS3/latest/dev/NotificationHowTo.html.
+func (api objectAPIHandlers) PutBucketNotificationHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := newContext(r, w, "PutBucketNotification")
 
-// CRLF character used for chunked transfer in accordance with HTTP standards.
-var crlf = []byte("\r\n")
+	defer logger.AuditLog(w, r, "PutBucketNotification", mustGetClaimsFromToken(r))
 
-// sendBucketNotification - writes notification back to client on the response writer
-// for each notification input, otherwise writes whitespace characters periodically
-// to keep the connection active. Each notification messages are terminated by CRLF
-// character. Upon any error received on response writer the for loop exits.
-//
-// TODO - do not log for all errors.
-func sendBucketNotification(w http.ResponseWriter, arnListenerCh <-chan []NotificationEvent) {
-	var dummyEvents = map[string][]NotificationEvent{"Records": nil}
-	// Continuously write to client either timely empty structures
-	// every 5 seconds, or return back the notifications.
-	for {
-		select {
-		case events := <-arnListenerCh:
-			if err := writeNotification(w, map[string][]NotificationEvent{"Records": events}); err != nil {
-				errorIf(err, "Unable to write notification to client.")
-				return
-			}
-		case <-time.After(5 * time.Second):
-			if err := writeNotification(w, dummyEvents); err != nil {
-				errorIf(err, "Unable to write notification to client.")
-				return
-			}
+	objectAPI := api.ObjectAPI()
+	if objectAPI == nil {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrServerNotInitialized), r.URL, guessIsBrowserReq(r))
+		return
+	}
+
+	if !objectAPI.IsNotificationSupported() {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrNotImplemented), r.URL, guessIsBrowserReq(r))
+		return
+	}
+
+	vars := mux.Vars(r)
+	bucketName := vars["bucket"]
+
+	if s3Error := checkRequestAuthType(ctx, r, policy.PutBucketNotificationAction, bucketName, ""); s3Error != ErrNone {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL, guessIsBrowserReq(r))
+		return
+	}
+
+	_, err := objectAPI.GetBucketInfo(ctx, bucketName)
+	if err != nil {
+		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL, guessIsBrowserReq(r))
+		return
+	}
+
+	// PutBucketNotification always needs a Content-Length.
+	if r.ContentLength <= 0 {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrMissingContentLength), r.URL, guessIsBrowserReq(r))
+		return
+	}
+
+	var config *event.Config
+	config, err = event.ParseConfig(io.LimitReader(r.Body, r.ContentLength), globalServerConfig.GetRegion(), globalNotificationSys.targetList)
+	if err != nil {
+		apiErr := errorCodes.ToAPIErr(ErrMalformedXML)
+		if event.IsEventError(err) {
+			apiErr = toAPIError(ctx, err)
 		}
+
+		writeErrorResponse(ctx, w, apiErr, r.URL, guessIsBrowserReq(r))
+		return
 	}
+
+	if err = saveNotificationConfig(ctx, objectAPI, bucketName, config); err != nil {
+		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL, guessIsBrowserReq(r))
+		return
+	}
+
+	rulesMap := config.ToRulesMap()
+	globalNotificationSys.AddRulesMap(bucketName, rulesMap)
+	globalNotificationSys.PutBucketNotification(ctx, bucketName, rulesMap)
+
+	writeSuccessResponseHeadersOnly(w)
 }
 
-// ListenBucketNotificationHandler - list bucket notifications.
+// ListenBucketNotificationHandler - This HTTP handler sends events to the connected HTTP client.
+// Client should send prefix/suffix object name to match and events to watch as query parameters.
 func (api objectAPIHandlers) ListenBucketNotificationHandler(w http.ResponseWriter, r *http.Request) {
-	// Validate request authorization.
-	if s3Error := checkAuth(r); s3Error != ErrNone {
-		writeErrorResponse(w, r, s3Error, r.URL.Path)
+	ctx := newContext(r, w, "ListenBucketNotification")
+
+	defer logger.AuditLog(w, r, "ListenBucketNotification", mustGetClaimsFromToken(r))
+
+	// Validate if bucket exists.
+	objAPI := api.ObjectAPI()
+	if objAPI == nil {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrServerNotInitialized), r.URL, guessIsBrowserReq(r))
+		return
+	}
+
+	if !objAPI.IsNotificationSupported() {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrNotImplemented), r.URL, guessIsBrowserReq(r))
+		return
+	}
+
+	if !objAPI.IsListenBucketSupported() {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrNotImplemented), r.URL, guessIsBrowserReq(r))
 		return
 	}
 	vars := mux.Vars(r)
-	bucket := vars["bucket"]
+	bucketName := vars["bucket"]
 
-	// Get notification ARN.
-	topicARN := r.URL.Query().Get("notificationARN")
-	if topicARN == "" {
-		writeErrorResponse(w, r, ErrARNNotification, r.URL.Path)
+	if s3Error := checkRequestAuthType(ctx, r, policy.ListenBucketNotificationAction, bucketName, ""); s3Error != ErrNone {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL, guessIsBrowserReq(r))
 		return
 	}
 
-	// Validate if bucket exists.
-	_, err := api.ObjectAPI.GetBucketInfo(bucket)
+	values := r.URL.Query()
+
+	var prefix string
+	if len(values["prefix"]) > 1 {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrFilterNamePrefix), r.URL, guessIsBrowserReq(r))
+		return
+	}
+
+	if len(values["prefix"]) == 1 {
+		if err := event.ValidateFilterRuleValue(values["prefix"][0]); err != nil {
+			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL, guessIsBrowserReq(r))
+			return
+		}
+
+		prefix = values["prefix"][0]
+	}
+
+	var suffix string
+	if len(values["suffix"]) > 1 {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrFilterNameSuffix), r.URL, guessIsBrowserReq(r))
+		return
+	}
+
+	if len(values["suffix"]) == 1 {
+		if err := event.ValidateFilterRuleValue(values["suffix"][0]); err != nil {
+			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL, guessIsBrowserReq(r))
+			return
+		}
+
+		suffix = values["suffix"][0]
+	}
+
+	pattern := event.NewPattern(prefix, suffix)
+
+	eventNames := []event.Name{}
+	for _, s := range values["events"] {
+		eventName, err := event.ParseName(s)
+		if err != nil {
+			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL, guessIsBrowserReq(r))
+			return
+		}
+
+		eventNames = append(eventNames, eventName)
+	}
+
+	if _, err := objAPI.GetBucketInfo(ctx, bucketName); err != nil {
+		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL, guessIsBrowserReq(r))
+		return
+	}
+
+	host, err := xnet.ParseHost(r.RemoteAddr)
 	if err != nil {
-		errorIf(err, "Unable to bucket info.")
-		writeErrorResponse(w, r, toAPIErrorCode(err), r.URL.Path)
+		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL, guessIsBrowserReq(r))
 		return
 	}
 
-	notificationCfg := eventN.GetBucketNotificationConfig(bucket)
-	if notificationCfg == nil {
-		writeErrorResponse(w, r, ErrARNNotification, r.URL.Path)
+	target, err := target.NewHTTPClientTarget(*host, w)
+	if err != nil {
+		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL, guessIsBrowserReq(r))
 		return
 	}
 
-	// Set SNS notifications only if special "listen" sns is set in bucket
-	// notification configs.
-	if !isMinioSNSConfigured(topicARN, notificationCfg.TopicConfigs) {
-		writeErrorResponse(w, r, ErrARNNotification, r.URL.Path)
+	rulesMap := event.NewRulesMap(eventNames, pattern, target.ID())
+
+	if err = globalNotificationSys.AddRemoteTarget(bucketName, target, rulesMap); err != nil {
+		logger.GetReqInfo(ctx).AppendTags("target", target.ID().Name)
+		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL, guessIsBrowserReq(r))
+		return
+	}
+	defer globalNotificationSys.RemoveRemoteTarget(bucketName, target.ID())
+	defer globalNotificationSys.RemoveRulesMap(bucketName, rulesMap)
+
+	thisAddr, err := xnet.ParseHost(GetLocalPeer(globalEndpoints))
+	if err != nil {
+		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL, guessIsBrowserReq(r))
 		return
 	}
 
-	// Add all common headers.
-	setCommonHeaders(w)
-
-	// Create a new notification event channel.
-	nEventCh := make(chan []NotificationEvent)
-	// Close the listener channel.
-	defer close(nEventCh)
-
-	// Set sns target.
-	eventN.SetSNSTarget(topicARN, nEventCh)
-	// Remove sns listener after the writer has closed or the client disconnected.
-	defer eventN.RemoveSNSTarget(topicARN, nEventCh)
-
-	// Start sending bucket notifications.
-	sendBucketNotification(w, nEventCh)
-}
-
-// Removes notification.xml for a given bucket, only used during DeleteBucket.
-func removeNotificationConfig(bucket string, objAPI ObjectLayer) error {
-	// Verify bucket is valid.
-	if !IsValidBucketName(bucket) {
-		return BucketNameInvalid{Bucket: bucket}
+	if err = SaveListener(objAPI, bucketName, eventNames, pattern, target.ID(), *thisAddr); err != nil {
+		logger.GetReqInfo(ctx).AppendTags("target", target.ID().Name)
+		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL, guessIsBrowserReq(r))
+		return
 	}
 
-	notificationConfigPath := path.Join(bucketConfigPrefix, bucket, bucketNotificationConfig)
-	return objAPI.DeleteObject(minioMetaBucket, notificationConfigPath)
+	globalNotificationSys.ListenBucketNotification(ctx, bucketName, eventNames, pattern, target.ID(), *thisAddr)
+
+	<-target.DoneCh
+
+	if err = RemoveListener(objAPI, bucketName, target.ID(), *thisAddr); err != nil {
+		logger.GetReqInfo(ctx).AppendTags("target", target.ID().Name)
+		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL, guessIsBrowserReq(r))
+		return
+	}
 }

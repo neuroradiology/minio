@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2015 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2015, 2016, 2017 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,65 +18,81 @@ package cmd
 
 import (
 	"fmt"
+	"math"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/cheggaaa/pb"
-	"github.com/fatih/color"
+	humanize "github.com/dustin/go-humanize"
 )
 
-// colorizeUpdateMessage - inspired from Yeoman project npm package https://github.com/yeoman/update-notifier
-func colorizeUpdateMessage(updateString string) string {
-	// Initialize coloring.
-	cyan := color.New(color.FgCyan, color.Bold).SprintFunc()
-	yellow := color.New(color.FgYellow, color.Bold).SprintfFunc()
+// prepareUpdateMessage - prepares the update message, only if a
+// newer version is available.
+func prepareUpdateMessage(downloadURL string, older time.Duration) string {
+	if downloadURL == "" || older <= 0 {
+		return ""
+	}
 
-	// Calculate length without color coding, due to ANSI color
-	// characters padded to actual string the final length is wrong
-	// than the original string length.
-	line1Str := fmt.Sprintf("  New update: %s ", updateString)
-	line1Length := len(line1Str)
+	// Compute friendly duration string to indicate time
+	// difference between newer and current release.
+	t := time.Time{}
+	newerThan := humanize.RelTime(t, t.Add(older), "ago", "")
+
+	// Return the nicely colored and formatted update message.
+	return colorizeUpdateMessage(downloadURL, newerThan)
+}
+
+// colorizeUpdateMessage - inspired from Yeoman project npm package https://github.com/yeoman/update-notifier
+func colorizeUpdateMessage(updateString string, newerThan string) string {
+	msgLine1Fmt := " You are running an older version of MinIO released %s "
+	msgLine2Fmt := " Update: %s "
+
+	// Calculate length *without* color coding: with ANSI terminal
+	// color characters, the result is incorrect.
+	line1Length := len(fmt.Sprintf(msgLine1Fmt, newerThan))
+	line2Length := len(fmt.Sprintf(msgLine2Fmt, updateString))
 
 	// Populate lines with color coding.
-	line1InColor := fmt.Sprintf("  New update: %s ", cyan(updateString))
+	line1InColor := fmt.Sprintf(msgLine1Fmt, colorYellowBold(newerThan))
+	line2InColor := fmt.Sprintf(msgLine2Fmt, colorCyanBold(updateString))
 
-	// Calculate the rectangular box size.
-	maxContentWidth := line1Length
-	line1Rest := maxContentWidth - line1Length
+	// calculate the rectangular box size.
+	maxContentWidth := int(math.Max(float64(line1Length), float64(line2Length)))
 
 	// termWidth is set to a default one to use when we are
 	// not able to calculate terminal width via OS syscalls
 	termWidth := 25
-
 	if width, err := pb.GetTerminalWidth(); err == nil {
 		termWidth = width
 	}
 
-	var message string
-	switch {
-	case len(line1Str) > termWidth:
-		message = "\n" + line1InColor + "\n"
-	default:
-		// On windows terminal turn off unicode characters.
-		var top, bottom, sideBar string
-		if runtime.GOOS == "windows" {
-			top = yellow("*" + strings.Repeat("*", maxContentWidth) + "*")
-			bottom = yellow("*" + strings.Repeat("*", maxContentWidth) + "*")
-			sideBar = yellow("|")
-		} else {
-			// Color the rectangular box, use unicode characters here.
-			top = yellow("┏" + strings.Repeat("━", maxContentWidth) + "┓")
-			bottom = yellow("┗" + strings.Repeat("━", maxContentWidth) + "┛")
-			sideBar = yellow("┃")
-		}
-		// Fill spaces to the rest of the area.
-		spacePaddingLine1 := strings.Repeat(" ", line1Rest)
-
-		// Construct the final message.
-		message = "\n" + top + "\n" +
-			sideBar + line1InColor + spacePaddingLine1 + sideBar + "\n" +
-			bottom + "\n"
+	// Box cannot be printed if terminal width is small than maxContentWidth
+	if maxContentWidth > termWidth {
+		return "\n" + line1InColor + "\n" + line2InColor + "\n\n"
 	}
-	// Return the final message.
-	return message
+
+	topLeftChar := "┏"
+	topRightChar := "┓"
+	bottomLeftChar := "┗"
+	bottomRightChar := "┛"
+	horizBarChar := "━"
+	vertBarChar := "┃"
+	// on windows terminal turn off unicode characters.
+	if runtime.GOOS == globalWindowsOSName {
+		topLeftChar = "+"
+		topRightChar = "+"
+		bottomLeftChar = "+"
+		bottomRightChar = "+"
+		horizBarChar = "-"
+		vertBarChar = "|"
+	}
+
+	lines := []string{
+		colorYellowBold(topLeftChar + strings.Repeat(horizBarChar, maxContentWidth) + topRightChar),
+		vertBarChar + line1InColor + strings.Repeat(" ", maxContentWidth-line1Length) + vertBarChar,
+		vertBarChar + line2InColor + strings.Repeat(" ", maxContentWidth-line2Length) + vertBarChar,
+		colorYellowBold(bottomLeftChar + strings.Repeat(horizBarChar, maxContentWidth) + bottomRightChar),
+	}
+	return "\n" + strings.Join(lines, "\n") + "\n"
 }

@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2015, 2016 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2015, 2016, 2017, 2018 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,24 +17,45 @@
 package cmd
 
 import (
-	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 
 	"github.com/minio/cli"
 	"github.com/minio/mc/pkg/console"
-	"github.com/pkg/profile"
+	"github.com/minio/minio/pkg/trie"
+	"github.com/minio/minio/pkg/words"
 )
 
-var (
-	// global flags for minio.
-	minioFlags = []cli.Flag{
-		cli.BoolFlag{
-			Name:  "help, h",
-			Usage: "Show help.",
-		},
-	}
-)
+// GlobalFlags - global flags for minio.
+var GlobalFlags = []cli.Flag{
+	cli.StringFlag{
+		Name:  "config-dir, C",
+		Value: defaultConfigDir.Get(),
+		Usage: "[DEPRECATED] path to legacy configuration directory",
+	},
+	cli.StringFlag{
+		Name:  "certs-dir, S",
+		Value: defaultCertsDir.Get(),
+		Usage: "path to certs directory",
+	},
+	cli.BoolFlag{
+		Name:  "quiet",
+		Usage: "disable startup information",
+	},
+	cli.BoolFlag{
+		Name:  "anonymous",
+		Usage: "hide sensitive information from logging",
+	},
+	cli.BoolFlag{
+		Name:  "json",
+		Usage: "output server logs and startup information in json format",
+	},
+	cli.BoolFlag{
+		Name:  "compat",
+		Usage: "trade off performance for S3 compatibility",
+	},
+}
 
 // Help template for minio.
 var minioHelpTemplate = `NAME:
@@ -44,150 +65,101 @@ DESCRIPTION:
   {{.Description}}
 
 USAGE:
-  minio {{if .Flags}}[flags] {{end}}command{{if .Flags}}{{end}} [arguments...]
+  {{.HelpName}} {{if .VisibleFlags}}[FLAGS] {{end}}COMMAND{{if .VisibleFlags}}{{end}} [ARGS...]
 
 COMMANDS:
-  {{range .Commands}}{{join .Names ", "}}{{ "\t" }}{{.Usage}}
-  {{end}}{{if .Flags}}
+  {{range .VisibleCommands}}{{join .Names ", "}}{{ "\t" }}{{.Usage}}
+  {{end}}{{if .VisibleFlags}}
 FLAGS:
-  {{range .Flags}}{{.}}
+  {{range .VisibleFlags}}{{.}}
   {{end}}{{end}}
 VERSION:
   ` + Version +
 	`{{ "\n"}}`
 
-// init - check the environment before main starts
-func init() {
-	// Check if minio was compiled using a supported version of Golang.
-	checkGoVersion()
+func newApp(name string) *cli.App {
+	// Collection of minio commands currently supported are.
+	commands := []cli.Command{}
 
-	// Set global trace flag.
-	globalTrace = os.Getenv("MINIO_TRACE") == "1"
-}
+	// Collection of minio commands currently supported in a trie tree.
+	commandsTree := trie.NewTrie()
 
-func migrate() {
-	// Migrate config file
-	migrateConfig()
-
-	// Migrate other configs here.
-}
-
-func enableLoggers() {
-	// Enable all loggers here.
-	enableConsoleLogger()
-	enableFileLogger()
-	// Add your logger here.
-}
-
-func findClosestCommands(command string) []string {
-	var closestCommands []string
-	for _, value := range commandsTree.PrefixMatch(command) {
-		closestCommands = append(closestCommands, value.(string))
+	// registerCommand registers a cli command.
+	registerCommand := func(command cli.Command) {
+		commands = append(commands, command)
+		commandsTree.Insert(command.Name)
 	}
-	sort.Strings(closestCommands)
-	// Suggest other close commands - allow missed, wrongly added and
-	// even transposed characters
-	for _, value := range commandsTree.walk(commandsTree.root) {
-		if sort.SearchStrings(closestCommands, value.(string)) < len(closestCommands) {
-			continue
-		}
-		// 2 is arbitrary and represents the max
-		// allowed number of typed errors
-		if DamerauLevenshteinDistance(command, value.(string)) < 2 {
+
+	findClosestCommands := func(command string) []string {
+		var closestCommands []string
+		for _, value := range commandsTree.PrefixMatch(command) {
 			closestCommands = append(closestCommands, value.(string))
 		}
-	}
-	return closestCommands
-}
 
-func registerApp() *cli.App {
+		sort.Strings(closestCommands)
+		// Suggest other close commands - allow missed, wrongly added and
+		// even transposed characters
+		for _, value := range commandsTree.Walk(commandsTree.Root()) {
+			if sort.SearchStrings(closestCommands, value.(string)) < len(closestCommands) {
+				continue
+			}
+			// 2 is arbitrary and represents the max
+			// allowed number of typed errors
+			if words.DamerauLevenshteinDistance(command, value.(string)) < 2 {
+				closestCommands = append(closestCommands, value.(string))
+			}
+		}
+
+		return closestCommands
+	}
+
 	// Register all commands.
 	registerCommand(serverCmd)
-	registerCommand(versionCmd)
+	registerCommand(gatewayCmd)
 	registerCommand(updateCmd)
-	registerCommand(controlCmd)
+	registerCommand(versionCmd)
 
 	// Set up app.
+	cli.HelpFlag = cli.BoolFlag{
+		Name:  "help, h",
+		Usage: "show help",
+	}
+
 	app := cli.NewApp()
-	app.Name = "Minio"
-	app.Author = "Minio.io"
+	app.Name = name
+	app.Author = "MinIO, Inc."
+	app.Version = Version
 	app.Usage = "Cloud Storage Server."
-	app.Description = `Minio is an Amazon S3 compatible object storage server. Use it to store photos, videos, VMs, containers, log files, or any blob of data as objects.`
-	app.Flags = append(minioFlags, globalFlags...)
+	app.Description = `MinIO is an Amazon S3 compatible object storage server. Use it to store photos, videos, VMs, containers, log files, or any blob of data as objects.`
+	app.Flags = GlobalFlags
+	app.HideVersion = true     // Hide `--version` flag, we already have `minio version`.
+	app.HideHelpCommand = true // Hide `help, h` command, we already have `minio --help`.
 	app.Commands = commands
 	app.CustomAppHelpTemplate = minioHelpTemplate
 	app.CommandNotFound = func(ctx *cli.Context, command string) {
-		msg := fmt.Sprintf("‘%s’ is not a minio sub-command. See ‘minio --help’.", command)
+		console.Printf("‘%s’ is not a minio sub-command. See ‘minio --help’.\n", command)
 		closestCommands := findClosestCommands(command)
 		if len(closestCommands) > 0 {
-			msg += fmt.Sprintf("\n\nDid you mean one of these?\n")
+			console.Println()
+			console.Println("Did you mean one of these?")
 			for _, cmd := range closestCommands {
-				msg += fmt.Sprintf("        ‘%s’\n", cmd)
+				console.Printf("\t‘%s’\n", cmd)
 			}
 		}
-		console.Fatalln(msg)
+
+		os.Exit(1)
 	}
+
 	return app
 }
 
-func checkMainSyntax(c *cli.Context) {
-	configPath, err := getConfigPath()
-	if err != nil {
-		console.Fatalf("Unable to obtain user's home directory. \nError: %s\n", err)
-	}
-	if configPath == "" {
-		console.Fatalln("Config folder cannot be empty, please specify --config-dir <foldername>.")
-	}
-}
-
-// Main - main for minio server.
-func Main() {
-	app := registerApp()
-	app.Before = func(c *cli.Context) error {
-		// Sets new config folder.
-		setGlobalConfigPath(c.GlobalString("config-dir"))
-
-		// Valid input arguments to main.
-		checkMainSyntax(c)
-
-		// Migrate any old version of config / state files to newer format.
-		migrate()
-
-		// Initialize config.
-		err := initConfig()
-		fatalIf(err, "Unable to initialize minio config.")
-
-		// Enable all loggers by now.
-		enableLoggers()
-
-		// Set global quiet flag.
-		globalQuiet = c.Bool("quiet") || c.GlobalBool("quiet")
-
-		// Do not print update messages, if quiet flag is set.
-		if !globalQuiet {
-			// Do not print any errors in release update function.
-			noError := true
-			updateMsg := getReleaseUpdate(minioUpdateStableURL, noError)
-			if updateMsg.Update {
-				console.Println(updateMsg)
-			}
-		}
-
-		return nil
-	}
-
-	// Set ``MINIO_PROFILE_DIR`` to the directory where profiling information should be persisted
-	profileDir := os.Getenv("MINIO_PROFILE_DIR")
-	// Enable profiler if ``MINIO_PROFILER`` is set. Supported options are [cpu, mem, block].
-	switch os.Getenv("MINIO_PROFILER") {
-	case "cpu":
-		defer profile.Start(profile.CPUProfile, profile.ProfilePath(profileDir)).Stop()
-	case "mem":
-		defer profile.Start(profile.MemProfile, profile.ProfilePath(profileDir)).Stop()
-	case "block":
-		defer profile.Start(profile.BlockProfile, profile.ProfilePath(profileDir)).Stop()
-	}
+// Main main for minio server.
+func Main(args []string) {
+	// Set the minio app name.
+	appName := filepath.Base(args[0])
 
 	// Run the app - exit on error.
-	app.RunAndExitOnError()
+	if err := newApp(appName).Run(args); err != nil {
+		os.Exit(1)
+	}
 }

@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2015 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2015, 2016, 2017 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,16 +17,88 @@
 package cmd
 
 import (
+	"bytes"
+	"context"
+	"crypto/tls"
 	"encoding/base64"
+	"encoding/json"
 	"encoding/xml"
 	"errors"
+	"fmt"
 	"io"
+	"io/ioutil"
+	"net"
+	"net/http"
+	"net/url"
 	"os"
-	"os/exec"
+	"path/filepath"
+	"reflect"
 	"strings"
-	"sync"
-	"syscall"
+	"time"
+
+	"github.com/minio/minio/cmd/logger"
+	"github.com/minio/minio/pkg/handlers"
+
+	humanize "github.com/dustin/go-humanize"
+	"github.com/gorilla/mux"
+	"github.com/pkg/profile"
 )
+
+// IsErrIgnored returns whether given error is ignored or not.
+func IsErrIgnored(err error, ignoredErrs ...error) bool {
+	return IsErr(err, ignoredErrs...)
+}
+
+// IsErr returns whether given error is exact error.
+func IsErr(err error, errs ...error) bool {
+	for _, exactErr := range errs {
+		if err == exactErr {
+			return true
+		}
+	}
+	return false
+}
+
+// make a copy of http.Header
+func cloneHeader(h http.Header) http.Header {
+	h2 := make(http.Header, len(h))
+	for k, vv := range h {
+		vv2 := make([]string, len(vv))
+		copy(vv2, vv)
+		h2[k] = vv2
+
+	}
+	return h2
+}
+
+// Convert url path into bucket and object name.
+func urlPath2BucketObjectName(path string) (bucketName, objectName string) {
+	// Trim any preceding slash separator.
+	urlPath := strings.TrimPrefix(path, slashSeparator)
+
+	// Split urlpath using slash separator into a given number of
+	// expected tokens.
+	tokens := strings.SplitN(urlPath, slashSeparator, 2)
+	bucketName = tokens[0]
+	if len(tokens) == 2 {
+		objectName = tokens[1]
+	}
+
+	// Success.
+	return bucketName, objectName
+}
+
+// URI scheme constants.
+const (
+	httpScheme  = "http"
+	httpsScheme = "https"
+)
+
+// nopCharsetConverter is a dummy charset convert which just copies input to output,
+// it is used to ignore custom encoding charset in S3 XML body.
+func nopCharsetConverter(label string, input io.Reader) (io.Reader, error) {
+	return input, nil
+}
 
 // xmlDecoder provide decoded value in xml.
 func xmlDecoder(body io.Reader, v interface{}, size int64) error {
@@ -37,176 +109,365 @@ func xmlDecoder(body io.Reader, v interface{}, size int64) error {
 		lbody = body
 	}
 	d := xml.NewDecoder(lbody)
+	// Ignore any encoding set in the XML body
+	d.CharsetReader = nopCharsetConverter
 	return d.Decode(v)
 }
 
 // checkValidMD5 - verify if valid md5, returns md5 in bytes.
-func checkValidMD5(md5 string) ([]byte, error) {
-	return base64.StdEncoding.DecodeString(strings.TrimSpace(md5))
+func checkValidMD5(h http.Header) ([]byte, error) {
+	md5B64, ok := h["Content-Md5"]
+	if ok {
+		if md5B64[0] == "" {
+			return nil, fmt.Errorf("Content-Md5 header set to empty value")
+		}
+		return base64.StdEncoding.DecodeString(md5B64[0])
+	}
+	return []byte{}, nil
 }
 
 /// http://docs.aws.amazon.com/AmazonS3/latest/dev/UploadingObjects.html
 const (
-	// maximum object size per PUT request is 5GiB
-	maxObjectSize = 1024 * 1024 * 1024 * 5
-	// minimum Part size for multipart upload is 5MB
-	minPartSize = 1024 * 1024 * 5
-	// maximum Part ID for multipart upload is 10000 (Acceptable values range from 1 to 10000 inclusive)
-	maxPartID = 10000
+	// Maximum object size per PUT request is 5TB.
+	// This is a divergence from S3 limit on purpose to support
+	// use cases where users are going to upload large files
+	// using 'curl' and presigned URL.
+	globalMaxObjectSize = 5 * humanize.TiByte
+
+	// Minimum Part size for multipart upload is 5MiB
+	globalMinPartSize = 5 * humanize.MiByte
+
+	// Maximum Part size for multipart upload is 5GiB
+	globalMaxPartSize = 5 * humanize.GiByte
+
+	// Maximum Part ID for multipart upload is 10000
+	// (Acceptable values range from 1 to 10000 inclusive)
+	globalMaxPartID = 10000
+
+	// Default values used while communicating with the cloud backends
+	defaultDialTimeout   = 30 * time.Second
+	defaultDialKeepAlive = 30 * time.Second
 )
 
 // isMaxObjectSize - verify if max object size
 func isMaxObjectSize(size int64) bool {
-	return size > maxObjectSize
+	return size > globalMaxObjectSize
+}
+
+// // Check if part size is more than maximum allowed size.
+func isMaxAllowedPartSize(size int64) bool {
+	return size > globalMaxPartSize
 }
 
 // Check if part size is more than or equal to minimum allowed size.
 func isMinAllowedPartSize(size int64) bool {
-	return size >= minPartSize
+	return size >= globalMinPartSize
 }
 
 // isMaxPartNumber - Check if part ID is greater than the maximum allowed ID.
 func isMaxPartID(partID int) bool {
-	return partID > maxPartID
+	return partID > globalMaxPartID
 }
 
-func contains(stringList []string, element string) bool {
-	for _, e := range stringList {
-		if e == element {
+func contains(slice interface{}, elem interface{}) bool {
+	v := reflect.ValueOf(slice)
+	if v.Kind() == reflect.Slice {
+		for i := 0; i < v.Len(); i++ {
+			if v.Index(i).Interface() == elem {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// profilerWrapper is created becauses pkg/profiler doesn't
+// provide any API to calculate the profiler file path in the
+// disk since the name of this latter is randomly generated.
+type profilerWrapper struct {
+	stopFn func()
+	pathFn func() string
+}
+
+func (p profilerWrapper) Stop() {
+	p.stopFn()
+}
+
+func (p profilerWrapper) Path() string {
+	return p.pathFn()
+}
+
+// Returns current profile data, returns error if there is no active
+// profiling in progress. Stops an active profile.
+func getProfileData() ([]byte, error) {
+	if globalProfiler == nil {
+		return nil, errors.New("profiler not enabled")
+	}
+
+	profilerPath := globalProfiler.Path()
+
+	// Stop the profiler
+	globalProfiler.Stop()
+
+	profilerFile, err := os.Open(profilerPath)
+	if err != nil {
+		return nil, err
+	}
+
+	return ioutil.ReadAll(profilerFile)
+}
+
+// Starts a profiler returns nil if profiler is not enabled, caller needs to handle this.
+func startProfiler(profilerType, dirPath string) (minioProfiler, error) {
+	var err error
+	if dirPath == "" {
+		dirPath, err = ioutil.TempDir("", "profile")
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	var profiler interface {
+		Stop()
+	}
+
+	var profilerFileName string
+
+	// Enable profiler and set the name of the file that pkg/pprof
+	// library creates to store profiling data.
+	switch profilerType {
+	case "cpu":
+		profiler = profile.Start(profile.CPUProfile, profile.NoShutdownHook, profile.ProfilePath(dirPath))
+		profilerFileName = "cpu.pprof"
+	case "mem":
+		profiler = profile.Start(profile.MemProfile, profile.NoShutdownHook, profile.ProfilePath(dirPath))
+		profilerFileName = "mem.pprof"
+	case "block":
+		profiler = profile.Start(profile.BlockProfile, profile.NoShutdownHook, profile.ProfilePath(dirPath))
+		profilerFileName = "block.pprof"
+	case "mutex":
+		profiler = profile.Start(profile.MutexProfile, profile.NoShutdownHook, profile.ProfilePath(dirPath))
+		profilerFileName = "mutex.pprof"
+	case "trace":
+		profiler = profile.Start(profile.TraceProfile, profile.NoShutdownHook, profile.ProfilePath(dirPath))
+		profilerFileName = "trace.out"
+	default:
+		return nil, errors.New("profiler type unknown")
+	}
+
+	return &profilerWrapper{
+		stopFn: profiler.Stop,
+		pathFn: func() string {
+			return filepath.Join(dirPath, profilerFileName)
+		},
+	}, nil
+}
+
+// minioProfiler - minio profiler interface.
+type minioProfiler interface {
+	// Stop the profiler
+	Stop()
+	// Return the path of the profiling file
+	Path() string
+}
+
+// Global profiler to be used by service go-routine.
+var globalProfiler minioProfiler
+
+// dump the request into a string in JSON format.
+func dumpRequest(r *http.Request) string {
+	header := cloneHeader(r.Header)
+	header.Set("Host", r.Host)
+	// Replace all '%' to '%%' so that printer format parser
+	// to ignore URL encoded values.
+	rawURI := strings.Replace(r.RequestURI, "%", "%%", -1)
+	req := struct {
+		Method     string      `json:"method"`
+		RequestURI string      `json:"reqURI"`
+		Header     http.Header `json:"header"`
+	}{r.Method, rawURI, header}
+
+	var buffer bytes.Buffer
+	enc := json.NewEncoder(&buffer)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(&req); err != nil {
+		// Upon error just return Go-syntax representation of the value
+		return fmt.Sprintf("%#v", req)
+	}
+
+	// Formatted string.
+	return strings.TrimSpace(buffer.String())
+}
+
+// isFile - returns whether given path is a file or not.
+func isFile(path string) bool {
+	if fi, err := os.Stat(path); err == nil {
+		return fi.Mode().IsRegular()
+	}
+
+	return false
+}
+
+// UTCNow - returns current UTC time.
+func UTCNow() time.Time {
+	return time.Now().UTC()
+}
+
+// GenETag - generate UUID based ETag
+func GenETag() string {
+	return ToS3ETag(getMD5Hash([]byte(mustGetUUID())))
+}
+
+// ToS3ETag - return checksum to ETag
+func ToS3ETag(etag string) string {
+	etag = canonicalizeETag(etag)
+
+	if !strings.HasSuffix(etag, "-1") {
+		// Tools like s3cmd uses ETag as checksum of data to validate.
+		// Append "-1" to indicate ETag is not a checksum.
+		etag += "-1"
+	}
+
+	return etag
+}
+
+// NewCustomHTTPTransport returns a new http configuration
+// used while communicating with the cloud backends.
+// This sets the value for MaxIdleConnsPerHost from 2 (go default)
+// to 100.
+func NewCustomHTTPTransport() *http.Transport {
+	return &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   defaultDialTimeout,
+			KeepAlive: defaultDialKeepAlive,
+		}).DialContext,
+		MaxIdleConns:          1024,
+		MaxIdleConnsPerHost:   1024,
+		IdleConnTimeout:       30 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		TLSClientConfig:       &tls.Config{RootCAs: globalRootCAs},
+		DisableCompression:    true,
+	}
+}
+
+// Load the json (typically from disk file).
+func jsonLoad(r io.ReadSeeker, data interface{}) error {
+	if _, err := r.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	return json.NewDecoder(r).Decode(data)
+}
+
+// Save to disk file in json format.
+func jsonSave(f interface {
+	io.WriteSeeker
+	Truncate(int64) error
+}, data interface{}) error {
+	b, err := json.Marshal(data)
+	if err != nil {
+		return err
+	}
+	if err = f.Truncate(0); err != nil {
+		return err
+	}
+	if _, err = f.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	_, err = f.Write(b)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// ceilFrac takes a numerator and denominator representing a fraction
+// and returns its ceiling. If denominator is 0, it returns 0 instead
+// of crashing.
+func ceilFrac(numerator, denominator int64) (ceil int64) {
+	if denominator == 0 {
+		// do nothing on invalid input
+		return
+	}
+	// Make denominator positive
+	if denominator < 0 {
+		numerator = -numerator
+		denominator = -denominator
+	}
+	ceil = numerator / denominator
+	if numerator > 0 && numerator%denominator != 0 {
+		ceil++
+	}
+	return
+}
+
+// Returns context with ReqInfo details set in the context.
+func newContext(r *http.Request, w http.ResponseWriter, api string) context.Context {
+	vars := mux.Vars(r)
+	bucket := vars["bucket"]
+	object := vars["object"]
+	prefix := vars["prefix"]
+
+	if prefix != "" {
+		object = prefix
+	}
+	reqInfo := &logger.ReqInfo{
+		DeploymentID: w.Header().Get(responseDeploymentIDKey),
+		RequestID:    w.Header().Get(responseRequestIDKey),
+		RemoteHost:   handlers.GetSourceIP(r),
+		UserAgent:    r.UserAgent(),
+		API:          api,
+		BucketName:   bucket,
+		ObjectName:   object,
+	}
+	return logger.SetReqInfo(context.Background(), reqInfo)
+}
+
+// isNetworkOrHostDown - if there was a network error or if the host is down.
+func isNetworkOrHostDown(err error) bool {
+	if err == nil {
+		return false
+	}
+	switch err.(type) {
+	case *net.DNSError, *net.OpError, net.UnknownNetworkError:
+		return true
+	case *url.Error:
+		// For a URL error, where it replies back "connection closed"
+		if strings.Contains(err.Error(), "Connection closed by foreign host") {
+			return true
+		}
+		return true
+	default:
+		if strings.Contains(err.Error(), "net/http: TLS handshake timeout") {
+			// If error is - tlsHandshakeTimeoutError,.
+			return true
+		} else if strings.Contains(err.Error(), "i/o timeout") {
+			// If error is - tcp timeoutError.
+			return true
+		} else if strings.Contains(err.Error(), "connection timed out") {
+			// If err is a net.Dial timeout.
+			return true
+		} else if strings.Contains(err.Error(), "net/http: HTTP/1.x transport connection broken") {
 			return true
 		}
 	}
 	return false
 }
 
-// Represents a type of an exit func which will be invoked upon shutdown signal.
-type onExitFunc func(code int)
-
-// Represents a type for all the the callback functions invoked upon shutdown signal.
-type cleanupOnExitFunc func() errCode
-
-// Represents a collection of various callbacks executed upon exit signals.
-type shutdownCallbacks struct {
-	// Protect callbacks list from a concurrent access
-	*sync.RWMutex
-	// genericCallbacks - is the list of function callbacks executed one by one
-	// when a shutdown starts. A callback returns 0 for success and 1 for failure.
-	// Failure is considered an emergency error that needs an immediate exit
-	genericCallbacks []cleanupOnExitFunc
-	// objectLayerCallbacks - contains the list of function callbacks that
-	// need to be invoked when a shutdown starts. These callbacks will be called before
-	// the general callback shutdowns
-	objectLayerCallbacks []cleanupOnExitFunc
-}
-
-// globalShutdownCBs stores regular and object storages callbacks
-var globalShutdownCBs *shutdownCallbacks
-
-func (s shutdownCallbacks) GetObjectLayerCBs() []cleanupOnExitFunc {
-	s.RLock()
-	defer s.RUnlock()
-	return s.objectLayerCallbacks
-}
-
-func (s shutdownCallbacks) GetGenericCBs() []cleanupOnExitFunc {
-	s.RLock()
-	defer s.RUnlock()
-	return s.genericCallbacks
-}
-
-func (s *shutdownCallbacks) AddObjectLayerCB(callback cleanupOnExitFunc) error {
-	s.Lock()
-	defer s.Unlock()
-	if callback == nil {
-		return errInvalidArgument
+// Used for registering with rest handlers (have a look at registerStorageRESTHandlers for usage example)
+// If it is passed ["aaaa", "bbbb"], it returns ["aaaa", "{aaaa:.*}", "bbbb", "{bbbb:.*}"]
+func restQueries(keys ...string) []string {
+	var accumulator []string
+	for _, key := range keys {
+		accumulator = append(accumulator, key, "{"+key+":.*}")
 	}
-	s.objectLayerCallbacks = append(s.objectLayerCallbacks, callback)
-	return nil
+	return accumulator
 }
 
-func (s *shutdownCallbacks) AddGenericCB(callback cleanupOnExitFunc) error {
-	s.Lock()
-	defer s.Unlock()
-	if callback == nil {
-		return errInvalidArgument
+// Reverse the input order of a slice of string
+func reverseStringSlice(input []string) {
+	for left, right := 0, len(input)-1; left < right; left, right = left+1, right-1 {
+		input[left], input[right] = input[right], input[left]
 	}
-	s.genericCallbacks = append(s.genericCallbacks, callback)
-	return nil
-}
-
-// Initialize graceful shutdown mechanism.
-func initGracefulShutdown(onExitFn onExitFunc) error {
-	// Validate exit func.
-	if onExitFn == nil {
-		return errInvalidArgument
-	}
-	globalShutdownCBs = &shutdownCallbacks{
-		RWMutex: &sync.RWMutex{},
-	}
-	// Return start monitor shutdown signal.
-	return startMonitorShutdownSignal(onExitFn)
-}
-
-type shutdownSignal int
-
-const (
-	shutdownHalt = iota
-	shutdownRestart
-)
-
-// Global shutdown signal channel.
-var globalShutdownSignalCh = make(chan shutdownSignal, 1)
-
-// Start to monitor shutdownSignal to execute shutdown callbacks
-func startMonitorShutdownSignal(onExitFn onExitFunc) error {
-	// Validate exit func.
-	if onExitFn == nil {
-		return errInvalidArgument
-	}
-	go func() {
-		defer close(globalShutdownSignalCh)
-		// Monitor signals.
-		trapCh := signalTrap(os.Interrupt, syscall.SIGTERM)
-		for {
-			select {
-			case <-trapCh:
-				// Initiate graceful shutdown.
-				globalShutdownSignalCh <- shutdownHalt
-			case signal := <-globalShutdownSignalCh:
-				// Call all object storage shutdown callbacks and exit for emergency
-				for _, callback := range globalShutdownCBs.GetObjectLayerCBs() {
-					exitCode := callback()
-					if exitCode != exitSuccess {
-						onExitFn(int(exitCode))
-					}
-
-				}
-				// Call all callbacks and exit for emergency
-				for _, callback := range globalShutdownCBs.GetGenericCBs() {
-					exitCode := callback()
-					if exitCode != exitSuccess {
-						onExitFn(int(exitCode))
-					}
-				}
-				// All shutdown callbacks ensure that the server is safely terminated
-				// and any concurrent process could be started again
-				if signal == shutdownRestart {
-					path := os.Args[0]
-					cmdArgs := os.Args[1:]
-					cmd := exec.Command(path, cmdArgs...)
-					cmd.Stdout = os.Stdout
-					cmd.Stderr = os.Stderr
-
-					err := cmd.Start()
-					if err != nil {
-						errorIf(errors.New("Unable to reboot."), err.Error())
-					}
-					onExitFn(int(exitSuccess))
-				}
-				onExitFn(int(exitSuccess))
-			}
-		}
-	}()
-	// Successfully started routine.
-	return nil
 }

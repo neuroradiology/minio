@@ -1,7 +1,7 @@
 // +build linux
 
 /*
- * Minio Cloud Storage, (C) 2015 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2017 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,12 +18,9 @@
 
 package disk
 
-import (
-	"strconv"
-	"syscall"
-)
+import "strconv"
 
-// fsType2StringMap - list of filesystems supported by donut on linux
+// fsType2StringMap - list of filesystems supported on linux
 var fsType2StringMap = map[string]string{
 	"1021994":  "TMPFS",
 	"137d":     "EXT",
@@ -37,19 +34,17 @@ var fsType2StringMap = map[string]string{
 	"ef51":     "EXT2OLD",
 	"ef53":     "EXT4",
 	"f15f":     "ecryptfs",
+	"794c7630": "overlayfs",
+	"2fc12fc1": "zfs",
+	"ff534d42": "cifs",
 }
 
 // getFSType returns the filesystem type of the underlying mounted filesystem
-func getFSType(path string) (string, error) {
-	s := syscall.Statfs_t{}
-	err := syscall.Statfs(path, &s)
-	if err != nil {
-		return "", err
-	}
-	fsTypeHex := strconv.FormatInt(int64(s.Type), 16)
+func getFSType(ftype int64) string {
+	fsTypeHex := strconv.FormatInt(ftype, 16)
 	fsTypeString, ok := fsType2StringMap[fsTypeHex]
-	if ok == false {
-		return "UNKNOWN", nil
+	if !ok {
+		return "UNKNOWN"
 	}
-	return fsTypeString, nil
+	return fsTypeString
 }

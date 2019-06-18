@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2016 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2016 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,46 +16,78 @@
 
 package cmd
 
-import "strings"
+import (
+	"context"
+	"sort"
+)
+
+// Returns function "listDir" of the type listDirFunc.
+// disks - used for doing disk.ListDir()
+func listDirFactory(ctx context.Context, disks ...StorageAPI) ListDirFunc {
+	// Returns sorted merged entries from all the disks.
+	listDir := func(bucket, prefixDir, prefixEntry string) (mergedEntries []string) {
+		for _, disk := range disks {
+			if disk == nil {
+				continue
+			}
+			var entries []string
+			var newEntries []string
+			var err error
+			entries, err = disk.ListDir(bucket, prefixDir, -1, xlMetaJSONFile)
+			if err != nil {
+				continue
+			}
+
+			// Find elements in entries which are not in mergedEntries
+			for _, entry := range entries {
+				idx := sort.SearchStrings(mergedEntries, entry)
+				// if entry is already present in mergedEntries don't add.
+				if idx < len(mergedEntries) && mergedEntries[idx] == entry {
+					continue
+				}
+				newEntries = append(newEntries, entry)
+			}
+
+			if len(newEntries) > 0 {
+				// Merge the entries and sort it.
+				mergedEntries = append(mergedEntries, newEntries...)
+				sort.Strings(mergedEntries)
+			}
+		}
+		return filterMatchingPrefix(mergedEntries, prefixEntry)
+	}
+	return listDir
+}
 
 // listObjects - wrapper function implemented over file tree walk.
-func (xl xlObjects) listObjects(bucket, prefix, marker, delimiter string, maxKeys int) (ListObjectsInfo, error) {
+func (xl xlObjects) listObjects(ctx context.Context, bucket, prefix, marker, delimiter string, maxKeys int) (loi ListObjectsInfo, e error) {
 	// Default is recursive, if delimiter is set then list non recursive.
 	recursive := true
 	if delimiter == slashSeparator {
 		recursive = false
 	}
 
-	heal := false // true only for xl.ListObjectsHeal
-	walkResultCh, endWalkCh := xl.listPool.Release(listParams{bucket, recursive, marker, prefix, heal})
+	walkResultCh, endWalkCh := xl.listPool.Release(listParams{bucket, recursive, marker, prefix, false})
 	if walkResultCh == nil {
 		endWalkCh = make(chan struct{})
-		isLeaf := xl.isObject
-		listDir := listDirFactory(isLeaf, xl.getLoadBalancedDisks()...)
-		walkResultCh = startTreeWalk(bucket, prefix, marker, recursive, listDir, isLeaf, endWalkCh)
+		listDir := listDirFactory(ctx, xl.getLoadBalancedDisks()...)
+		walkResultCh = startTreeWalk(ctx, bucket, prefix, marker, recursive, listDir, endWalkCh)
 	}
 
 	var objInfos []ObjectInfo
 	var eof bool
 	var nextMarker string
 	for i := 0; i < maxKeys; {
+
 		walkResult, ok := <-walkResultCh
 		if !ok {
 			// Closed channel.
 			eof = true
 			break
 		}
-		// For any walk error return right away.
-		if walkResult.err != nil {
-			// File not found is a valid case.
-			if walkResult.err == errFileNotFound {
-				return ListObjectsInfo{}, nil
-			}
-			return ListObjectsInfo{}, toObjectErr(walkResult.err, bucket, prefix)
-		}
 		entry := walkResult.entry
 		var objInfo ObjectInfo
-		if strings.HasSuffix(entry, slashSeparator) {
+		if hasSuffix(entry, slashSeparator) {
 			// Object name needs to be full path.
 			objInfo.Bucket = bucket
 			objInfo.Name = entry
@@ -63,14 +95,18 @@ func (xl xlObjects) listObjects(bucket, prefix, marker, delimiter string, maxKey
 		} else {
 			// Set the Mode to a "regular" file.
 			var err error
-			objInfo, err = xl.getObjectInfo(bucket, entry)
+			objInfo, err = xl.getObjectInfo(ctx, bucket, entry)
 			if err != nil {
-				// Ignore errFileNotFound
-				if err == errFileNotFound {
-					errorIf(err, "Unable to get object info", bucket, entry)
+				// Ignore errFileNotFound as the object might have got
+				// deleted in the interim period of listing and getObjectInfo(),
+				// ignore quorum error as it might be an entry from an outdated disk.
+				if IsErrIgnored(err, []error{
+					errFileNotFound,
+					errXLReadQuorum,
+				}...) {
 					continue
 				}
-				return ListObjectsInfo{}, toObjectErr(err, bucket, prefix)
+				return loi, toObjectErr(err, bucket, prefix)
 			}
 		}
 		nextMarker = objInfo.Name
@@ -82,61 +118,47 @@ func (xl xlObjects) listObjects(bucket, prefix, marker, delimiter string, maxKey
 		}
 	}
 
-	params := listParams{bucket, recursive, nextMarker, prefix, heal}
+	params := listParams{bucket, recursive, nextMarker, prefix, false}
 	if !eof {
 		xl.listPool.Set(params, walkResultCh, endWalkCh)
 	}
 
-	result := ListObjectsInfo{IsTruncated: !eof}
+	result := ListObjectsInfo{}
 	for _, objInfo := range objInfos {
-		result.NextMarker = objInfo.Name
-		if objInfo.IsDir {
+		if objInfo.IsDir && delimiter == slashSeparator {
 			result.Prefixes = append(result.Prefixes, objInfo.Name)
 			continue
 		}
-		result.Objects = append(result.Objects, ObjectInfo{
-			Name:    objInfo.Name,
-			ModTime: objInfo.ModTime,
-			Size:    objInfo.Size,
-			MD5Sum:  objInfo.MD5Sum,
-			IsDir:   false,
-		})
+		result.Objects = append(result.Objects, objInfo)
 	}
+
+	if !eof {
+		result.IsTruncated = true
+		if len(objInfos) > 0 {
+			result.NextMarker = objInfos[len(objInfos)-1].Name
+		}
+	}
+
 	return result, nil
 }
 
 // ListObjects - list all objects at prefix, delimited by '/'.
-func (xl xlObjects) ListObjects(bucket, prefix, marker, delimiter string, maxKeys int) (ListObjectsInfo, error) {
-	// Verify if bucket is valid.
-	if !IsValidBucketName(bucket) {
-		return ListObjectsInfo{}, BucketNameInvalid{Bucket: bucket}
-	}
-	// Verify if bucket exists.
-	if !xl.isBucketExist(bucket) {
-		return ListObjectsInfo{}, BucketNotFound{Bucket: bucket}
-	}
-	if !IsValidObjectPrefix(prefix) {
-		return ListObjectsInfo{}, ObjectNameInvalid{Bucket: bucket, Object: prefix}
-	}
-	// Verify if delimiter is anything other than '/', which we do not support.
-	if delimiter != "" && delimiter != slashSeparator {
-		return ListObjectsInfo{}, UnsupportedDelimiter{
-			Delimiter: delimiter,
-		}
-	}
-	// Verify if marker has prefix.
-	if marker != "" {
-		if !strings.HasPrefix(marker, prefix) {
-			return ListObjectsInfo{}, InvalidMarkerPrefixCombination{
-				Marker: marker,
-				Prefix: prefix,
-			}
-		}
+func (xl xlObjects) ListObjects(ctx context.Context, bucket, prefix, marker, delimiter string, maxKeys int) (loi ListObjectsInfo, e error) {
+	if err := checkListObjsArgs(ctx, bucket, prefix, marker, delimiter, xl); err != nil {
+		return loi, err
 	}
 
 	// With max keys of zero we have reached eof, return right here.
 	if maxKeys == 0 {
-		return ListObjectsInfo{}, nil
+		return loi, nil
+	}
+
+	// Marker is set validate pre-condition.
+	if marker != "" {
+		// Marker not common with prefix is not implemented.Send an empty response
+		if !hasPrefix(marker, prefix) {
+			return ListObjectsInfo{}, e
+		}
 	}
 
 	// For delimiter and prefix as '/' we do not list anything at all
@@ -144,7 +166,7 @@ func (xl xlObjects) ListObjects(bucket, prefix, marker, delimiter string, maxKey
 	// with the prefix. On a flat namespace with 'prefix' as '/'
 	// we don't have any entries, since all the keys are of form 'keyName/...'
 	if delimiter == slashSeparator && prefix == slashSeparator {
-		return ListObjectsInfo{}, nil
+		return loi, nil
 	}
 
 	// Over flowing count - reset to maxObjectList.
@@ -153,12 +175,12 @@ func (xl xlObjects) ListObjects(bucket, prefix, marker, delimiter string, maxKey
 	}
 
 	// Initiate a list operation, if successful filter and return quickly.
-	listObjInfo, err := xl.listObjects(bucket, prefix, marker, delimiter, maxKeys)
+	listObjInfo, err := xl.listObjects(ctx, bucket, prefix, marker, delimiter, maxKeys)
 	if err == nil {
 		// We got the entries successfully return.
 		return listObjInfo, nil
 	}
 
 	// Return error at the end.
-	return ListObjectsInfo{}, toObjectErr(err, bucket, prefix)
+	return loi, toObjectErr(err, bucket, prefix)
 }

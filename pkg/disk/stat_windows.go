@@ -1,7 +1,7 @@
 // +build windows
 
 /*
- * Minio Cloud Storage, (C) 2015 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2015 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,6 +24,19 @@ import (
 	"unsafe"
 )
 
+var (
+	kernel32 = syscall.NewLazyDLL("kernel32.dll")
+
+	// GetDiskFreeSpaceEx - https://msdn.microsoft.com/en-us/library/windows/desktop/aa364937(v=vs.85).aspx
+	// Retrieves information about the amount of space that is available on a disk volume,
+	// which is the total amount of space, the total amount of free space, and the total
+	// amount of free space available to the user that is associated with the calling thread.
+	GetDiskFreeSpaceEx = kernel32.NewProc("GetDiskFreeSpaceExW")
+	// GetDiskFreeSpace - https://msdn.microsoft.com/en-us/library/windows/desktop/aa364935(v=vs.85).aspx
+	// Retrieves information about the specified disk, including the amount of free space on the disk.
+	GetDiskFreeSpace = kernel32.NewProc("GetDiskFreeSpaceW")
+)
+
 // GetInfo returns total and free bytes available in a directory, e.g. `C:\`.
 // It returns free space available to the user (including quota limitations)
 //
@@ -33,13 +46,6 @@ func GetInfo(path string) (info Info, err error) {
 	if _, err = os.Stat(path); err != nil {
 		return Info{}, err
 	}
-
-	dll := syscall.MustLoadDLL("kernel32.dll")
-	// https://msdn.microsoft.com/en-us/library/windows/desktop/aa364937(v=vs.85).aspx
-	// Retrieves information about the amount of space that is available on a disk volume,
-	// which is the total amount of space, the total amount of free space, and the total
-	// amount of free space available to the user that is associated with the calling thread.
-	GetDiskFreeSpaceEx := dll.MustFindProc("GetDiskFreeSpaceExW")
 
 	lpFreeBytesAvailable := int64(0)
 	lpTotalNumberOfBytes := int64(0)
@@ -57,13 +63,9 @@ func GetInfo(path string) (info Info, err error) {
 		uintptr(unsafe.Pointer(&lpTotalNumberOfBytes)),
 		uintptr(unsafe.Pointer(&lpTotalNumberOfFreeBytes)))
 	info = Info{}
-	info.Total = int64(lpTotalNumberOfBytes)
-	info.Free = int64(lpFreeBytesAvailable)
+	info.Total = uint64(lpTotalNumberOfBytes)
+	info.Free = uint64(lpFreeBytesAvailable)
 	info.FSType = getFSType(path)
-
-	// https://msdn.microsoft.com/en-us/library/windows/desktop/aa364935(v=vs.85).aspx
-	// Retrieves information about the specified disk, including the amount of free space on the disk.
-	GetDiskFreeSpace := dll.MustFindProc("GetDiskFreeSpaceW")
 
 	// Return values of GetDiskFreeSpace()
 	lpSectorsPerCluster := uint32(0)
@@ -85,8 +87,8 @@ func GetInfo(path string) (info Info, err error) {
 		uintptr(unsafe.Pointer(&lpNumberOfFreeClusters)),
 		uintptr(unsafe.Pointer(&lpTotalNumberOfClusters)))
 
-	info.Files = int64(lpTotalNumberOfClusters)
-	info.Ffree = int64(lpNumberOfFreeClusters)
+	info.Files = uint64(lpTotalNumberOfClusters)
+	info.Ffree = uint64(lpNumberOfFreeClusters)
 
 	return info, nil
 }

@@ -2,13 +2,10 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// Package leaktest provides tools to detect leaked goroutines in tests.
-// To use it, call "defer leaktest.AfterTest(t)()" at the beginning of each
-// test that may use goroutines.
 package cmd
 
 import (
-	"runtime"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"time"
@@ -50,14 +47,14 @@ func (initialSnapShot LeakDetect) CompareCurrentSnapshot() []string {
 	return stackDiff
 }
 
-// DetectLeak - Creates a snapshot of runtiem stack and compares it with  the initial stack snapshot.
+// DetectLeak - Creates a snapshot of runtime stack and compares it with the initial stack snapshot.
 func (initialSnapShot LeakDetect) DetectLeak(t TestErrHandler) {
 	if t.Failed() {
 		return
 	}
 	// Loop, waiting for goroutines to shut down.
 	// Wait up to 5 seconds, but finish as quickly as possible.
-	deadline := time.Now().Add(leakDetectDeadline * time.Second)
+	deadline := UTCNow().Add(leakDetectDeadline * time.Second)
 	for {
 		// get sack snapshot of relevant go routines.
 		leaked := initialSnapShot.CompareCurrentSnapshot()
@@ -66,7 +63,7 @@ func (initialSnapShot LeakDetect) DetectLeak(t TestErrHandler) {
 			return
 		}
 		// wait a test again will deadline.
-		if time.Now().Before(deadline) {
+		if UTCNow().Before(deadline) {
 			time.Sleep(leakDetectPauseTimeMs * time.Millisecond)
 			continue
 		}
@@ -78,7 +75,7 @@ func (initialSnapShot LeakDetect) DetectLeak(t TestErrHandler) {
 	}
 }
 
-// DetectTestLeak -  snapshots the currently-running goroutines and returns a
+// DetectTestLeak -  snapshots the currently running goroutines and returns a
 // function to be run at the end of tests to see whether any
 // goroutines leaked.
 // Usage: `defer DetectTestLeak(t)()` in beginning line of benchmarks or unit tests.
@@ -126,9 +123,8 @@ func isIgnoredStackFn(stack string) (ok bool) {
 // pickRelevantGoroutines returns all goroutines we care about for the purpose
 // of leak checking. It excludes testing or runtime ones.
 func pickRelevantGoroutines() (gs []string) {
-	// make a large buffer to hold the runtime stack info.
-	buf := make([]byte, 2<<20)
-	buf = buf[:runtime.Stack(buf, true)]
+	// get runtime stack buffer.
+	buf := debug.Stack()
 	// runtime stack of go routines will be listed with 2 blank spaces between each of them, so split on "\n\n" .
 	for _, g := range strings.Split(string(buf), "\n\n") {
 		// Again split on a new line, the first line of the second half contaisn the info about the go routine.

@@ -1,5 +1,5 @@
 /*
- * Minio Client, (C) 2015 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2015, 2016, 2017, 2018 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,33 +17,79 @@
 package cmd
 
 import (
+	"context"
 	"os"
-	"os/signal"
+	"strings"
+
+	"github.com/minio/minio/cmd/logger"
 )
 
-// signalTrap traps the registered signals and notifies the caller.
-func signalTrap(sig ...os.Signal) <-chan bool {
-	// channel to notify the caller.
-	trapCh := make(chan bool, 1)
+func handleSignals() {
+	// Custom exit function
+	exit := func(state bool) {
+		// If global profiler is set stop before we exit.
+		if globalProfiler != nil {
+			globalProfiler.Stop()
+		}
 
-	go func(chan<- bool) {
-		// channel to receive signals.
-		sigCh := make(chan os.Signal, 1)
-		defer close(sigCh)
+		if state {
+			os.Exit(0)
+		}
 
-		// `signal.Notify` registers the given channel to
-		// receive notifications of the specified signals.
-		signal.Notify(sigCh, sig...)
+		os.Exit(1)
+	}
 
-		// Wait for the signal.
-		<-sigCh
+	stopProcess := func() bool {
+		var err, oerr error
 
-		// Once signal has been received stop signal Notify handler.
-		signal.Stop(sigCh)
+		if globalNotificationSys != nil {
+			globalNotificationSys.RemoveAllRemoteTargets()
+		}
 
-		// Notify the caller.
-		trapCh <- true
-	}(trapCh)
+		// Stop watching for any certificate changes.
+		globalTLSCerts.Stop()
 
-	return trapCh
+		err = globalHTTPServer.Shutdown()
+		logger.LogIf(context.Background(), err)
+
+		// send signal to various go-routines that they need to quit.
+		close(GlobalServiceDoneCh)
+
+		if objAPI := newObjectLayerFn(); objAPI != nil {
+			oerr = objAPI.Shutdown(context.Background())
+			logger.LogIf(context.Background(), oerr)
+		}
+
+		return (err == nil && oerr == nil)
+	}
+
+	for {
+		select {
+		case err := <-globalHTTPServerErrorCh:
+			logger.LogIf(context.Background(), err)
+			var oerr error
+			if objAPI := newObjectLayerFn(); objAPI != nil {
+				oerr = objAPI.Shutdown(context.Background())
+			}
+
+			exit(err == nil && oerr == nil)
+		case osSignal := <-globalOSSignalCh:
+			logger.Info("Exiting on signal: %s", strings.ToUpper(osSignal.String()))
+			exit(stopProcess())
+		case signal := <-globalServiceSignalCh:
+			switch signal {
+			case serviceStatus:
+				// Ignore this at the moment.
+			case serviceRestart:
+				logger.Info("Restarting on service signal")
+				stop := stopProcess()
+				rerr := restartProcess()
+				logger.LogIf(context.Background(), rerr)
+				exit(stop && rerr == nil)
+			case serviceStop:
+				logger.Info("Stopping on service signal")
+				exit(stopProcess())
+			}
+		}
+	}
 }

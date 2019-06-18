@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2015 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2015 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,9 +17,12 @@
 package cmd
 
 import (
+	"net/http"
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/minio/minio/pkg/auth"
 )
 
 // credentialHeader data type represents structured form of Credential
@@ -34,47 +37,88 @@ type credentialHeader struct {
 	}
 }
 
+// Return scope string.
+func (c credentialHeader) getScope() string {
+	return strings.Join([]string{
+		c.scope.date.Format(yyyymmdd),
+		c.scope.region,
+		c.scope.service,
+		c.scope.request,
+	}, "/")
+}
+
+func getReqAccessKeyV4(r *http.Request, region string, stype serviceType) (auth.Credentials, bool, APIErrorCode) {
+	ch, err := parseCredentialHeader("Credential="+r.URL.Query().Get("X-Amz-Credential"), region, stype)
+	if err != ErrNone {
+		// Strip off the Algorithm prefix.
+		v4Auth := strings.TrimPrefix(r.Header.Get("Authorization"), signV4Algorithm)
+		authFields := strings.Split(strings.TrimSpace(v4Auth), ",")
+		if len(authFields) != 3 {
+			return auth.Credentials{}, false, ErrMissingFields
+		}
+		ch, err = parseCredentialHeader(authFields[0], region, stype)
+		if err != ErrNone {
+			return auth.Credentials{}, false, err
+		}
+	}
+	return checkKeyValid(ch.accessKey)
+}
+
 // parse credentialHeader string into its structured form.
-func parseCredentialHeader(credElement string) (credentialHeader, APIErrorCode) {
-	creds := strings.Split(strings.TrimSpace(credElement), "=")
+func parseCredentialHeader(credElement string, region string, stype serviceType) (ch credentialHeader, aec APIErrorCode) {
+	creds := strings.SplitN(strings.TrimSpace(credElement), "=", 2)
 	if len(creds) != 2 {
-		return credentialHeader{}, ErrMissingFields
+		return ch, ErrMissingFields
 	}
 	if creds[0] != "Credential" {
-		return credentialHeader{}, ErrMissingCredTag
+		return ch, ErrMissingCredTag
 	}
 	credElements := strings.Split(strings.TrimSpace(creds[1]), "/")
-	if len(credElements) != 5 {
-		return credentialHeader{}, ErrCredMalformed
+	if len(credElements) < 5 {
+		return ch, ErrCredMalformed
 	}
-	if !isValidAccessKey.MatchString(credElements[0]) {
-		return credentialHeader{}, ErrInvalidAccessKeyID
+	accessKey := strings.Join(credElements[:len(credElements)-4], "/") // The access key may contain one or more `/`
+	if !auth.IsAccessKeyValid(accessKey) {
+		return ch, ErrInvalidAccessKeyID
 	}
 	// Save access key id.
 	cred := credentialHeader{
-		accessKey: credElements[0],
+		accessKey: accessKey,
 	}
+	credElements = credElements[len(credElements)-4:]
 	var e error
-	cred.scope.date, e = time.Parse(yyyymmdd, credElements[1])
+	cred.scope.date, e = time.Parse(yyyymmdd, credElements[0])
 	if e != nil {
-		return credentialHeader{}, ErrMalformedCredentialDate
+		return ch, ErrMalformedCredentialDate
 	}
-	if credElements[2] == "" {
-		return credentialHeader{}, ErrMalformedCredentialRegion
+
+	cred.scope.region = credElements[1]
+	// Verify if region is valid.
+	sRegion := cred.scope.region
+	// Region is set to be empty, we use whatever was sent by the
+	// request and proceed further. This is a work-around to address
+	// an important problem for ListBuckets() getting signed with
+	// different regions.
+	if region == "" {
+		region = sRegion
 	}
-	cred.scope.region = credElements[2]
-	if credElements[3] != "s3" {
-		return credentialHeader{}, ErrInvalidService
+	// Should validate region, only if region is set.
+	if !isValidRegion(sRegion, region) {
+		return ch, ErrAuthorizationHeaderMalformed
+
 	}
-	cred.scope.service = credElements[3]
-	if credElements[4] != "aws4_request" {
-		return credentialHeader{}, ErrInvalidRequestVersion
+	if credElements[2] != string(stype) {
+		return ch, ErrInvalidService
 	}
-	cred.scope.request = credElements[4]
+	cred.scope.service = credElements[2]
+	if credElements[3] != "aws4_request" {
+		return ch, ErrInvalidRequestVersion
+	}
+	cred.scope.request = credElements[3]
 	return cred, ErrNone
 }
 
-// Parse signature string.
+// Parse signature from signature tag.
 func parseSignature(signElement string) (string, APIErrorCode) {
 	signFields := strings.Split(strings.TrimSpace(signElement), "=")
 	if len(signFields) != 2 {
@@ -83,18 +127,24 @@ func parseSignature(signElement string) (string, APIErrorCode) {
 	if signFields[0] != "Signature" {
 		return "", ErrMissingSignTag
 	}
+	if signFields[1] == "" {
+		return "", ErrMissingFields
+	}
 	signature := signFields[1]
 	return signature, ErrNone
 }
 
-// Parse signed headers string.
-func parseSignedHeaders(signedHdrElement string) ([]string, APIErrorCode) {
+// Parse slice of signed headers from signed headers tag.
+func parseSignedHeader(signedHdrElement string) ([]string, APIErrorCode) {
 	signedHdrFields := strings.Split(strings.TrimSpace(signedHdrElement), "=")
 	if len(signedHdrFields) != 2 {
 		return nil, ErrMissingFields
 	}
 	if signedHdrFields[0] != "SignedHeaders" {
 		return nil, ErrMissingSignHeadersTag
+	}
+	if signedHdrFields[1] == "" {
+		return nil, ErrMissingFields
 	}
 	signedHeaders := strings.Split(signedHdrFields[1], ";")
 	return signedHeaders, ErrNone
@@ -122,8 +172,7 @@ type preSignValues struct {
 //   querystring += &X-Amz-Expires=timeout interval
 //   querystring += &X-Amz-SignedHeaders=signed_headers
 //   querystring += &X-Amz-Signature=signature
-//{
-
+//
 // verifies if any of the necessary query params are missing in the presigned request.
 func doesV4PresignParamsExist(query url.Values) APIErrorCode {
 	v4PresignQueryParams := []string{"X-Amz-Algorithm", "X-Amz-Credential", "X-Amz-Signature", "X-Amz-Date", "X-Amz-SignedHeaders", "X-Amz-Expires"}
@@ -135,59 +184,60 @@ func doesV4PresignParamsExist(query url.Values) APIErrorCode {
 	return ErrNone
 }
 
-func parsePreSignV4(query url.Values) (preSignValues, APIErrorCode) {
-	var err APIErrorCode
+// Parses all the presigned signature values into separate elements.
+func parsePreSignV4(query url.Values, region string, stype serviceType) (psv preSignValues, aec APIErrorCode) {
 	// verify whether the required query params exist.
-	err = doesV4PresignParamsExist(query)
+	err := doesV4PresignParamsExist(query)
 	if err != ErrNone {
-		return preSignValues{}, err
+		return psv, err
 	}
 
 	// Verify if the query algorithm is supported or not.
 	if query.Get("X-Amz-Algorithm") != signV4Algorithm {
-		return preSignValues{}, ErrInvalidQuerySignatureAlgo
+		return psv, ErrInvalidQuerySignatureAlgo
 	}
 
 	// Initialize signature version '4' structured header.
 	preSignV4Values := preSignValues{}
 
 	// Save credential.
-	preSignV4Values.Credential, err = parseCredentialHeader("Credential=" + query.Get("X-Amz-Credential"))
+	preSignV4Values.Credential, err = parseCredentialHeader("Credential="+query.Get("X-Amz-Credential"), region, stype)
 	if err != ErrNone {
-		return preSignValues{}, err
+		return psv, err
 	}
 
 	var e error
 	// Save date in native time.Time.
 	preSignV4Values.Date, e = time.Parse(iso8601Format, query.Get("X-Amz-Date"))
 	if e != nil {
-		return preSignValues{}, ErrMalformedPresignedDate
+		return psv, ErrMalformedPresignedDate
 	}
 
 	// Save expires in native time.Duration.
 	preSignV4Values.Expires, e = time.ParseDuration(query.Get("X-Amz-Expires") + "s")
 	if e != nil {
-		return preSignValues{}, ErrMalformedExpires
+		return psv, ErrMalformedExpires
 	}
 
 	if preSignV4Values.Expires < 0 {
-		return preSignValues{}, ErrNegativeExpires
+		return psv, ErrNegativeExpires
 	}
+
+	// Check if Expiry time is less than 7 days (value in seconds).
+	if preSignV4Values.Expires.Seconds() > 604800 {
+		return psv, ErrMaximumExpires
+	}
+
 	// Save signed headers.
-	preSignV4Values.SignedHeaders, err = parseSignedHeaders("SignedHeaders=" + query.Get("X-Amz-SignedHeaders"))
+	preSignV4Values.SignedHeaders, err = parseSignedHeader("SignedHeaders=" + query.Get("X-Amz-SignedHeaders"))
 	if err != ErrNone {
-		return preSignValues{}, err
-	}
-	// `host` is the only header used during the presigned request.
-	// Malformed signed headers has be caught here, otherwise it'll lead to signature mismatch.
-	if preSignV4Values.SignedHeaders[0] != "host" {
-		return preSignValues{}, ErrUnsignedHeaders
+		return psv, err
 	}
 
 	// Save signature.
 	preSignV4Values.Signature, err = parseSignature("Signature=" + query.Get("X-Amz-Signature"))
 	if err != ErrNone {
-		return preSignValues{}, err
+		return psv, err
 	}
 
 	// Return structed form of signature query string.
@@ -199,25 +249,25 @@ func parsePreSignV4(query url.Values) (preSignValues, APIErrorCode) {
 //    Authorization: algorithm Credential=accessKeyID/credScope, \
 //            SignedHeaders=signedHeaders, Signature=signature
 //
-func parseSignV4(v4Auth string) (signValues, APIErrorCode) {
+func parseSignV4(v4Auth string, region string, stype serviceType) (sv signValues, aec APIErrorCode) {
 	// Replace all spaced strings, some clients can send spaced
 	// parameters and some won't. So we pro-actively remove any spaces
 	// to make parsing easier.
 	v4Auth = strings.Replace(v4Auth, " ", "", -1)
 	if v4Auth == "" {
-		return signValues{}, ErrAuthHeaderEmpty
+		return sv, ErrAuthHeaderEmpty
 	}
 
 	// Verify if the header algorithm is supported or not.
 	if !strings.HasPrefix(v4Auth, signV4Algorithm) {
-		return signValues{}, ErrSignatureVersionNotSupported
+		return sv, ErrSignatureVersionNotSupported
 	}
 
 	// Strip off the Algorithm prefix.
 	v4Auth = strings.TrimPrefix(v4Auth, signV4Algorithm)
 	authFields := strings.Split(strings.TrimSpace(v4Auth), ",")
 	if len(authFields) != 3 {
-		return signValues{}, ErrMissingFields
+		return sv, ErrMissingFields
 	}
 
 	// Initialize signature version '4' structured header.
@@ -225,21 +275,21 @@ func parseSignV4(v4Auth string) (signValues, APIErrorCode) {
 
 	var err APIErrorCode
 	// Save credentail values.
-	signV4Values.Credential, err = parseCredentialHeader(authFields[0])
+	signV4Values.Credential, err = parseCredentialHeader(authFields[0], region, stype)
 	if err != ErrNone {
-		return signValues{}, err
+		return sv, err
 	}
 
 	// Save signed headers.
-	signV4Values.SignedHeaders, err = parseSignedHeaders(authFields[1])
+	signV4Values.SignedHeaders, err = parseSignedHeader(authFields[1])
 	if err != ErrNone {
-		return signValues{}, err
+		return sv, err
 	}
 
 	// Save signature.
 	signV4Values.Signature, err = parseSignature(authFields[2])
 	if err != ErrNone {
-		return signValues{}, err
+		return sv, err
 	}
 
 	// Return the structure here.
