@@ -1,38 +1,51 @@
-/*
- * MinIO Cloud Storage, (C) 2015, 2016, 2017, 2018 MinIO, Inc.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// Copyright (c) 2015-2021 MinIO, Inc.
+//
+// This file is part of MinIO Object Storage stack
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 package cmd
 
 import (
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"sort"
+	"strconv"
+	"strings"
+	"time"
 
 	"github.com/minio/cli"
-	"github.com/minio/mc/pkg/console"
-	"github.com/minio/minio/pkg/trie"
-	"github.com/minio/minio/pkg/words"
+	"github.com/minio/minio/internal/color"
+	"github.com/minio/minio/internal/logger"
+	"github.com/minio/pkg/v3/console"
+	"github.com/minio/pkg/v3/env"
+	"github.com/minio/pkg/v3/trie"
+	"github.com/minio/pkg/v3/words"
 )
 
 // GlobalFlags - global flags for minio.
 var GlobalFlags = []cli.Flag{
+	// Deprecated flag, so its hidden now - existing deployments will keep working.
 	cli.StringFlag{
-		Name:  "config-dir, C",
-		Value: defaultConfigDir.Get(),
-		Usage: "[DEPRECATED] path to legacy configuration directory",
+		Name:   "config-dir, C",
+		Value:  defaultConfigDir.Get(),
+		Usage:  "[DEPRECATED] path to legacy configuration directory",
+		Hidden: true,
 	},
 	cli.StringFlag{
 		Name:  "certs-dir, S",
@@ -41,7 +54,7 @@ var GlobalFlags = []cli.Flag{
 	},
 	cli.BoolFlag{
 		Name:  "quiet",
-		Usage: "disable startup information",
+		Usage: "disable startup and info messages",
 	},
 	cli.BoolFlag{
 		Name:  "anonymous",
@@ -49,11 +62,19 @@ var GlobalFlags = []cli.Flag{
 	},
 	cli.BoolFlag{
 		Name:  "json",
-		Usage: "output server logs and startup information in json format",
+		Usage: "output logs in JSON format",
 	},
+	// Deprecated flag, so its hidden now, existing deployments will keep working.
 	cli.BoolFlag{
-		Name:  "compat",
-		Usage: "trade off performance for S3 compatibility",
+		Name:   "compat",
+		Usage:  "enable strict S3 compatibility by turning off certain performance optimizations",
+		Hidden: true,
+	},
+	// This flag is hidden and to be used only during certain performance testing.
+	cli.BoolFlag{
+		Name:   "no-compat",
+		Usage:  "disable strict S3 compatibility by turning on certain performance optimizations",
+		Hidden: true,
 	},
 }
 
@@ -74,8 +95,8 @@ FLAGS:
   {{range .VisibleFlags}}{{.}}
   {{end}}{{end}}
 VERSION:
-  ` + Version +
-	`{{ "\n"}}`
+  {{.Version}}
+`
 
 func newApp(name string) *cli.App {
 	// Collection of minio commands currently supported are.
@@ -86,27 +107,30 @@ func newApp(name string) *cli.App {
 
 	// registerCommand registers a cli command.
 	registerCommand := func(command cli.Command) {
+		// avoid registering commands which are not being built (via
+		// go:build tags)
+		if command.Name == "" {
+			return
+		}
 		commands = append(commands, command)
 		commandsTree.Insert(command.Name)
 	}
 
 	findClosestCommands := func(command string) []string {
 		var closestCommands []string
-		for _, value := range commandsTree.PrefixMatch(command) {
-			closestCommands = append(closestCommands, value.(string))
-		}
+		closestCommands = append(closestCommands, commandsTree.PrefixMatch(command)...)
 
 		sort.Strings(closestCommands)
 		// Suggest other close commands - allow missed, wrongly added and
 		// even transposed characters
 		for _, value := range commandsTree.Walk(commandsTree.Root()) {
-			if sort.SearchStrings(closestCommands, value.(string)) < len(closestCommands) {
+			if sort.SearchStrings(closestCommands, value) < len(closestCommands) {
 				continue
 			}
 			// 2 is arbitrary and represents the max
 			// allowed number of typed errors
-			if words.DamerauLevenshteinDistance(command, value.(string)) < 2 {
-				closestCommands = append(closestCommands, value.(string))
+			if words.DamerauLevenshteinDistance(command, value) < 2 {
+				closestCommands = append(closestCommands, value)
 			}
 		}
 
@@ -115,24 +139,22 @@ func newApp(name string) *cli.App {
 
 	// Register all commands.
 	registerCommand(serverCmd)
-	registerCommand(gatewayCmd)
-	registerCommand(updateCmd)
-	registerCommand(versionCmd)
+	registerCommand(fmtGenCmd)
 
 	// Set up app.
 	cli.HelpFlag = cli.BoolFlag{
 		Name:  "help, h",
 		Usage: "show help",
 	}
+	cli.VersionPrinter = printMinIOVersion
 
 	app := cli.NewApp()
 	app.Name = name
 	app.Author = "MinIO, Inc."
-	app.Version = Version
-	app.Usage = "Cloud Storage Server."
-	app.Description = `MinIO is an Amazon S3 compatible object storage server. Use it to store photos, videos, VMs, containers, log files, or any blob of data as objects.`
+	app.Version = ReleaseTag
+	app.Usage = "High Performance Object Storage"
+	app.Description = `Build high performance data infrastructure for machine learning, analytics and application data workloads with MinIO`
 	app.Flags = GlobalFlags
-	app.HideVersion = true     // Hide `--version` flag, we already have `minio version`.
 	app.HideHelpCommand = true // Hide `help, h` command, we already have `minio --help`.
 	app.Commands = commands
 	app.CustomAppHelpTemplate = minioHelpTemplate
@@ -153,13 +175,54 @@ func newApp(name string) *cli.App {
 	return app
 }
 
+func startupBanner(banner io.Writer) {
+	CopyrightYear = strconv.Itoa(time.Now().Year())
+	fmt.Fprintln(banner, color.Blue("Copyright:")+color.Bold(" 2015-%s MinIO, Inc.", CopyrightYear))
+	fmt.Fprintln(banner, color.Blue("License:")+color.Bold(" "+MinioLicense))
+	fmt.Fprintln(banner, color.Blue("Version:")+color.Bold(" %s (%s %s/%s)", ReleaseTag, runtime.Version(), runtime.GOOS, runtime.GOARCH))
+}
+
+func versionBanner(c *cli.Context) io.Reader {
+	banner := &strings.Builder{}
+	fmt.Fprintln(banner, color.Bold("%s version %s (commit-id=%s)", c.App.Name, c.App.Version, CommitID))
+	fmt.Fprintln(banner, color.Blue("Runtime:")+color.Bold(" %s %s/%s", runtime.Version(), runtime.GOOS, runtime.GOARCH))
+	fmt.Fprintln(banner, color.Blue("License:")+color.Bold(" GNU AGPLv3 - https://www.gnu.org/licenses/agpl-3.0.html"))
+	fmt.Fprintln(banner, color.Blue("Copyright:")+color.Bold(" 2015-%s MinIO, Inc.", CopyrightYear))
+	return strings.NewReader(banner.String())
+}
+
+func printMinIOVersion(c *cli.Context) {
+	io.Copy(c.App.Writer, versionBanner(c))
+}
+
+var debugNoExit = env.Get("_MINIO_DEBUG_NO_EXIT", "") != ""
+
 // Main main for minio server.
 func Main(args []string) {
 	// Set the minio app name.
 	appName := filepath.Base(args[0])
 
+	if debugNoExit {
+		freeze := func(_ int) {
+			// Infinite blocking op
+			<-make(chan struct{})
+		}
+
+		// Override the logger os.Exit()
+		logger.ExitFunc = freeze
+
+		defer func() {
+			if err := recover(); err != nil {
+				fmt.Println("panic:", err)
+				fmt.Println("")
+				fmt.Println(string(debug.Stack()))
+			}
+			freeze(-1)
+		}()
+	}
+
 	// Run the app - exit on error.
 	if err := newApp(appName).Run(args); err != nil {
-		os.Exit(1)
+		os.Exit(1) //nolint:gocritic
 	}
 }

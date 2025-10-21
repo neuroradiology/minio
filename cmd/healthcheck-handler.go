@@ -1,108 +1,212 @@
-/*
- * MinIO Cloud Storage, (C) 2018 MinIO, Inc.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// Copyright (c) 2015-2021 MinIO, Inc.
+//
+// This file is part of MinIO Object Storage stack
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 package cmd
 
 import (
-	"fmt"
+	"context"
 	"net/http"
-	"os"
-	"runtime"
+	"strconv"
+	"time"
 
-	"github.com/minio/minio/cmd/logger"
+	xhttp "github.com/minio/minio/internal/http"
+	"github.com/minio/minio/internal/kms"
 )
 
-const (
-	minioHealthGoroutineThreshold = 1000
-)
+const unavailable = "offline"
 
-// ReadinessCheckHandler -- checks if there are more than threshold number of goroutines running,
-// returns service unavailable.
-// Readiness probes are used to detect situations where application is under heavy load
-// and temporarily unable to serve. In a orchestrated setup like Kubernetes, containers reporting
-// that they are not ready do not receive traffic through Kubernetes Services.
-func ReadinessCheckHandler(w http.ResponseWriter, r *http.Request) {
-	if err := goroutineCountCheck(minioHealthGoroutineThreshold); err != nil {
+func checkHealth(w http.ResponseWriter) ObjectLayer {
+	objLayer := newObjectLayerFn()
+	if objLayer == nil {
+		w.Header().Set(xhttp.MinIOServerStatus, unavailable)
 		writeResponse(w, http.StatusServiceUnavailable, nil, mimeNone)
+		return nil
+	}
+
+	if !globalBucketMetadataSys.Initialized() {
+		w.Header().Set(xhttp.MinIOServerStatus, "bucket-metadata-offline")
+		writeResponse(w, http.StatusServiceUnavailable, nil, mimeNone)
+		return nil
+	}
+
+	if !globalIAMSys.Initialized() {
+		w.Header().Set(xhttp.MinIOServerStatus, "iam-offline")
+		writeResponse(w, http.StatusServiceUnavailable, nil, mimeNone)
+		return nil
+	}
+
+	return objLayer
+}
+
+// ClusterCheckHandler returns if the server is ready for requests.
+func ClusterCheckHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := newContext(r, w, "ClusterCheckHandler")
+
+	objLayer := checkHealth(w)
+	if objLayer == nil {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, globalAPIConfig.getClusterDeadline())
+	defer cancel()
+
+	opts := HealthOptions{
+		Maintenance:    r.Form.Get("maintenance") == "true",
+		DeploymentType: r.Form.Get("deployment-type"),
+	}
+	result := objLayer.Health(ctx, opts)
+	w.Header().Set(xhttp.MinIOWriteQuorum, strconv.Itoa(result.WriteQuorum))
+	w.Header().Set(xhttp.MinIOStorageClassDefaults, strconv.FormatBool(result.UsingDefaults))
+	// return how many drives are being healed if any
+	if result.HealingDrives > 0 {
+		w.Header().Set(xhttp.MinIOHealingDrives, strconv.Itoa(result.HealingDrives))
+	}
+	if !result.Healthy {
+		// As a maintenance call we are purposefully asked to be taken
+		// down, this is for orchestrators to know if we can safely
+		// take this server down, return appropriate error.
+		if opts.Maintenance {
+			writeResponse(w, http.StatusPreconditionFailed, nil, mimeNone)
+		} else {
+			writeResponse(w, http.StatusServiceUnavailable, nil, mimeNone)
+		}
 		return
 	}
 	writeResponse(w, http.StatusOK, nil, mimeNone)
 }
 
-// LivenessCheckHandler -- checks if server can reach its disks internally.
-// If not, server is considered to have failed and needs to be restarted.
-// Liveness probes are used to detect situations where application (minio)
-// has gone into a state where it can not recover except by being restarted.
-func LivenessCheckHandler(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "LivenessCheckHandler")
+// ClusterReadCheckHandler returns if the server is ready for requests.
+func ClusterReadCheckHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := newContext(r, w, "ClusterReadCheckHandler")
 
-	objLayer := newObjectLayerFn()
-	// Service not initialized yet
+	objLayer := checkHealth(w)
 	if objLayer == nil {
-		writeResponse(w, http.StatusServiceUnavailable, nil, mimeNone)
 		return
 	}
 
-	if !globalIsXL && !globalIsDistXL {
-		s := objLayer.StorageInfo(ctx)
-		// Gateways don't provide disk info.
-		if s.Backend.Type == Unknown {
-			// ListBuckets to confirm gateway backend is up
-			if _, err := objLayer.ListBuckets(ctx); err != nil {
-				writeResponse(w, http.StatusServiceUnavailable, nil, mimeNone)
-				return
+	ctx, cancel := context.WithTimeout(ctx, globalAPIConfig.getClusterDeadline())
+	defer cancel()
+
+	opts := HealthOptions{
+		Maintenance:    r.Form.Get("maintenance") == "true",
+		DeploymentType: r.Form.Get("deployment-type"),
+	}
+	result := objLayer.Health(ctx, opts)
+	w.Header().Set(xhttp.MinIOReadQuorum, strconv.Itoa(result.ReadQuorum))
+	w.Header().Set(xhttp.MinIOStorageClassDefaults, strconv.FormatBool(result.UsingDefaults))
+	// return how many drives are being healed if any
+	if result.HealingDrives > 0 {
+		w.Header().Set(xhttp.MinIOHealingDrives, strconv.Itoa(result.HealingDrives))
+	}
+	if !result.HealthyRead {
+		// As a maintenance call we are purposefully asked to be taken
+		// down, this is for orchestrators to know if we can safely
+		// take this server down, return appropriate error.
+		if opts.Maintenance {
+			writeResponse(w, http.StatusPreconditionFailed, nil, mimeNone)
+		} else {
+			writeResponse(w, http.StatusServiceUnavailable, nil, mimeNone)
+		}
+		return
+	}
+	writeResponse(w, http.StatusOK, nil, mimeNone)
+}
+
+// ReadinessCheckHandler checks whether MinIO is up and ready to serve requests.
+// It also checks whether the KMS is available and whether etcd is reachable,
+// if configured.
+func ReadinessCheckHandler(w http.ResponseWriter, r *http.Request) {
+	if objLayer := newObjectLayerFn(); objLayer == nil {
+		w.Header().Set(xhttp.MinIOServerStatus, unavailable) // Service not initialized yet
+	}
+	if r.Header.Get(xhttp.MinIOPeerCall) != "" {
+		writeResponse(w, http.StatusOK, nil, mimeNone)
+		return
+	}
+
+	if int(globalHTTPStats.loadRequestsInQueue()) > globalAPIConfig.getRequestsPoolCapacity() {
+		apiErr := getAPIError(ErrBusy)
+		switch r.Method {
+		case http.MethodHead:
+			writeResponse(w, apiErr.HTTPStatusCode, nil, mimeNone)
+		case http.MethodGet:
+			writeErrorResponse(r.Context(), w, apiErr, r.URL)
+		}
+		return
+	}
+
+	// Verify if KMS is reachable if its configured
+	if GlobalKMS != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), time.Minute)
+		defer cancel()
+
+		if _, err := GlobalKMS.GenerateKey(ctx, &kms.GenerateKeyRequest{AssociatedData: kms.Context{"healthcheck": ""}}); err != nil {
+			switch r.Method {
+			case http.MethodHead:
+				apiErr := toAPIError(r.Context(), err)
+				writeResponse(w, apiErr.HTTPStatusCode, nil, mimeNone)
+			case http.MethodGet:
+				writeErrorResponse(r.Context(), w, toAPIError(r.Context(), err), r.URL)
 			}
-			writeResponse(w, http.StatusOK, nil, mimeNone)
 			return
 		}
 	}
 
-	// For FS and Erasure backend, check if local disks are up.
-	var totalLocalDisks int
-	var erroredDisks int
-	for _, endpoint := range globalEndpoints {
-		// Check only if local disks are accessible, we do not have
-		// to reach to rest of the other servers in a distributed setup.
-		if endpoint.IsLocal {
-			totalLocalDisks++
-			// Attempt a stat to backend, any error resulting
-			// from this Stat() operation is considered as backend
-			// is not available, count them as errors.
-			if _, err := os.Stat(endpoint.Path); err != nil {
-				logger.LogIf(ctx, err)
-				erroredDisks++
+	if globalEtcdClient != nil {
+		// Borrowed from
+		// https://github.com/etcd-io/etcd/blob/main/etcdctl/ctlv3/command/ep_command.go#L118
+		ctx, cancel := context.WithTimeout(r.Context(), defaultContextTimeout)
+		defer cancel()
+		if _, err := globalEtcdClient.Get(ctx, "health"); err != nil {
+			// etcd unreachable throw an error..
+			switch r.Method {
+			case http.MethodHead:
+				apiErr := toAPIError(r.Context(), err)
+				writeResponse(w, apiErr.HTTPStatusCode, nil, mimeNone)
+			case http.MethodGet:
+				writeErrorResponse(r.Context(), w, toAPIError(r.Context(), err), r.URL)
 			}
+			return
 		}
-	}
-
-	// If all exported local disks have errored, we simply let kubernetes
-	// take us down.
-	if totalLocalDisks == erroredDisks {
-		writeResponse(w, http.StatusServiceUnavailable, nil, mimeNone)
-		return
 	}
 	writeResponse(w, http.StatusOK, nil, mimeNone)
 }
 
-// checks threshold against total number of go-routines in the system and throws error if
-// more than threshold go-routines are running.
-func goroutineCountCheck(threshold int) error {
-	count := runtime.NumGoroutine()
-	if count > threshold {
-		return fmt.Errorf("too many goroutines (%d > %d)", count, threshold)
+// LivenessCheckHandler checks whether MinIO is up. It differs from the
+// readiness handler since a failing liveness check causes pod restarts
+// in K8S environments. Therefore, it does not contact external systems.
+func LivenessCheckHandler(w http.ResponseWriter, r *http.Request) {
+	if objLayer := newObjectLayerFn(); objLayer == nil {
+		w.Header().Set(xhttp.MinIOServerStatus, unavailable) // Service not initialized yet
 	}
-	return nil
+	if r.Header.Get(xhttp.MinIOPeerCall) != "" {
+		writeResponse(w, http.StatusOK, nil, mimeNone)
+		return
+	}
+
+	if int(globalHTTPStats.loadRequestsInQueue()) > globalAPIConfig.getRequestsPoolCapacity() {
+		apiErr := getAPIError(ErrBusy)
+		switch r.Method {
+		case http.MethodHead:
+			writeResponse(w, apiErr.HTTPStatusCode, nil, mimeNone)
+		case http.MethodGet:
+			writeErrorResponse(r.Context(), w, apiErr, r.URL)
+		}
+		return
+	}
+	writeResponse(w, http.StatusOK, nil, mimeNone)
 }

@@ -1,30 +1,29 @@
-/*
- * MinIO Cloud Storage, (C) 2017 MinIO, Inc.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// Copyright (c) 2015-2021 MinIO, Inc.
+//
+// This file is part of MinIO Object Storage stack
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 package cmd
 
 import (
 	"errors"
 	"fmt"
-	"net"
 	"reflect"
-	"runtime"
 	"testing"
 
-	"github.com/minio/minio-go/v6/pkg/set"
+	"github.com/minio/minio-go/v7/pkg/set"
 )
 
 func TestMustSplitHostPort(t *testing.T) {
@@ -35,11 +34,9 @@ func TestMustSplitHostPort(t *testing.T) {
 	}{
 		{":54321", "", "54321"},
 		{"server:54321", "server", "54321"},
-		{":", "", ""},
 		{":0", "", "0"},
-		{":-10", "", "-10"},
-		{"server:100000000", "server", "100000000"},
-		{"server:https", "server", "https"},
+		{"server:https", "server", "443"},
+		{"server:http", "server", "80"},
 	}
 
 	for _, testCase := range testCases {
@@ -85,7 +82,7 @@ func TestSortIPs(t *testing.T) {
 			ipList:       []string{"127.0.0.1"},
 			sortedIPList: []string{"127.0.0.1"},
 		},
-		// Non parsable ip is assumed to be hostame and gets preserved
+		// Non parsable ip is assumed to be hostname and gets preserved
 		// as the left most elements, regardless of IP based sorting.
 		{
 			ipList:       []string{"hostname", "127.0.0.1", "192.168.1.106"},
@@ -134,32 +131,40 @@ func TestGetHostIP(t *testing.T) {
 		expectedErr    error
 	}{
 		{"localhost", set.CreateStringSet("127.0.0.1"), nil},
-		{"example.org", set.CreateStringSet("93.184.216.34"), nil},
 	}
 
 	for _, testCase := range testCases {
 		ipList, err := getHostIP(testCase.host)
-		if testCase.expectedErr == nil {
+		switch {
+		case testCase.expectedErr == nil:
 			if err != nil {
 				t.Fatalf("error: expected = <nil>, got = %v", err)
 			}
-		} else if err == nil {
+		case err == nil:
 			t.Fatalf("error: expected = %v, got = <nil>", testCase.expectedErr)
-		} else if testCase.expectedErr.Error() != err.Error() {
+		case testCase.expectedErr.Error() != err.Error():
 			t.Fatalf("error: expected = %v, got = %v", testCase.expectedErr, err)
 		}
 
-		if testCase.expectedIPList != nil && testCase.expectedIPList.Intersection(ipList).IsEmpty() {
-			t.Fatalf("host: expected = %v, got = %v", testCase.expectedIPList, ipList)
+		if testCase.expectedIPList != nil {
+			var found bool
+			for _, ip := range ipList.ToSlice() {
+				if testCase.expectedIPList.Contains(ip) {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("host: expected = %v, got = %v", testCase.expectedIPList, ipList)
+			}
 		}
 	}
 }
 
 // Tests finalize api endpoints.
 func TestGetAPIEndpoints(t *testing.T) {
-	host, port := globalMinioHost, globalMinioAddr
+	host, port := globalMinioHost, globalMinioPort
 	defer func() {
-		globalMinioHost, globalMinioAddr = host, port
+		globalMinioHost, globalMinioPort = host, port
 	}()
 	testCases := []struct {
 		host, port     string
@@ -180,58 +185,6 @@ func TestGetAPIEndpoints(t *testing.T) {
 	}
 }
 
-// Ask the kernel for a free open port.
-func getFreePort() string {
-	addr, err := net.ResolveTCPAddr("tcp", "localhost:0")
-	if err != nil {
-		panic(err)
-	}
-
-	l, err := net.ListenTCP("tcp", addr)
-	if err != nil {
-		panic(err)
-	}
-	defer l.Close()
-	return fmt.Sprintf("%d", l.Addr().(*net.TCPAddr).Port)
-}
-
-// Tests for port availability logic written for server startup sequence.
-func TestCheckPortAvailability(t *testing.T) {
-	// Make a port is not available.
-	port := getFreePort()
-	listener, err := net.Listen("tcp", net.JoinHostPort("", port))
-	if err != nil {
-		t.Fatalf("Unable to listen on port %v", port)
-	}
-	defer listener.Close()
-
-	testCases := []struct {
-		port        string
-		expectedErr error
-	}{
-		{port, fmt.Errorf("listen tcp :%v: bind: address already in use", port)},
-		{getFreePort(), nil},
-	}
-
-	for _, testCase := range testCases {
-		// On MS Windows, skip checking error case due to https://github.com/golang/go/issues/7598
-		if runtime.GOOS == globalWindowsOSName && testCase.expectedErr != nil {
-			continue
-		}
-
-		err := checkPortAvailability(testCase.port)
-		if testCase.expectedErr == nil {
-			if err != nil {
-				t.Fatalf("error: expected = <nil>, got = %v", err)
-			}
-		} else if err == nil {
-			t.Fatalf("error: expected = %v, got = <nil>", testCase.expectedErr)
-		} else if testCase.expectedErr.Error() != err.Error() {
-			t.Fatalf("error: expected = %v, got = %v", testCase.expectedErr, err)
-		}
-	}
-}
-
 func TestCheckLocalServerAddr(t *testing.T) {
 	testCases := []struct {
 		serverAddr  string
@@ -240,24 +193,27 @@ func TestCheckLocalServerAddr(t *testing.T) {
 		{":54321", nil},
 		{"localhost:54321", nil},
 		{"0.0.0.0:9000", nil},
-		{"", fmt.Errorf("missing port in address")},
-		{"localhost", fmt.Errorf("address localhost: missing port in address")},
+		{":0", nil},
+		{"localhost", nil},
+		{"", fmt.Errorf("invalid argument")},
 		{"example.org:54321", fmt.Errorf("host in server address should be this server")},
-		{":0", fmt.Errorf("port number must be between 1 to 65535")},
-		{":-10", fmt.Errorf("port number must be between 1 to 65535")},
+		{":-10", fmt.Errorf("port must be between 0 to 65535")},
 	}
 
 	for _, testCase := range testCases {
-		err := CheckLocalServerAddr(testCase.serverAddr)
-		if testCase.expectedErr == nil {
-			if err != nil {
-				t.Fatalf("error: expected = <nil>, got = %v", err)
+		t.Run("", func(t *testing.T) {
+			err := CheckLocalServerAddr(testCase.serverAddr)
+			switch {
+			case testCase.expectedErr == nil:
+				if err != nil {
+					t.Errorf("error: expected = <nil>, got = %v", err)
+				}
+			case err == nil:
+				t.Errorf("error: expected = %v, got = <nil>", testCase.expectedErr)
+			case testCase.expectedErr.Error() != err.Error():
+				t.Errorf("error: expected = %v, got = %v", testCase.expectedErr, err)
 			}
-		} else if err == nil {
-			t.Fatalf("error: expected = %v, got = <nil>", testCase.expectedErr)
-		} else if testCase.expectedErr.Error() != err.Error() {
-			t.Fatalf("error: expected = %v, got = %v", testCase.expectedErr, err)
-		}
+		})
 	}
 }
 
@@ -277,22 +233,21 @@ func TestExtractHostPort(t *testing.T) {
 
 	for i, testCase := range testCases {
 		host, port, err := extractHostPort(testCase.addr)
-		if testCase.expectedErr == nil {
-			if err != nil {
-				t.Fatalf("Test %d: should succeed but failed with err: %v", i+1, err)
-			}
+		if testCase.expectedErr == nil && err != nil {
+			t.Fatalf("Test %d: should succeed but failed with err: %v", i+1, err)
+		}
+		if testCase.expectedErr != nil && err == nil {
+			t.Fatalf("Test %d:, should fail but succeeded.", i+1)
+		}
+		if err == nil {
 			if host != testCase.host {
 				t.Fatalf("Test %d: expected: %v, found: %v", i+1, testCase.host, host)
 			}
 			if port != testCase.port {
 				t.Fatalf("Test %d: expected: %v, found: %v", i+1, testCase.port, port)
 			}
-
 		}
-		if testCase.expectedErr != nil {
-			if err == nil {
-				t.Fatalf("Test %d:, should fail but succeeded.", i+1)
-			}
+		if testCase.expectedErr != nil && err != nil {
 			if testCase.expectedErr.Error() != err.Error() {
 				t.Fatalf("Test %d: failed with different error, expected: '%v', found:'%v'.", i+1, testCase.expectedErr, err)
 			}
@@ -316,25 +271,29 @@ func TestSameLocalAddrs(t *testing.T) {
 		{"http://8.8.8.8:9000", "http://localhost:9000", false, nil},
 	}
 
-	for i, testCase := range testCases {
-		sameAddr, err := sameLocalAddrs(testCase.addr1, testCase.addr2)
-		if testCase.expectedErr != nil && err == nil {
-			t.Fatalf("Test %d: should fail but succeeded", i+1)
-		}
-		if testCase.expectedErr == nil && err != nil {
-			t.Fatalf("Test %d: should succeed but failed with %v", i+1, err)
-		}
-		if err == nil {
-			if sameAddr != testCase.sameAddr {
-				t.Fatalf("Test %d: expected: %v, found: %v", i+1, testCase.sameAddr, sameAddr)
+	for _, testCase := range testCases {
+		t.Run("", func(t *testing.T) {
+			sameAddr, err := sameLocalAddrs(testCase.addr1, testCase.addr2)
+			if testCase.expectedErr != nil && err == nil {
+				t.Errorf("should fail but succeeded")
 			}
-		} else {
-			if err.Error() != testCase.expectedErr.Error() {
-				t.Fatalf("Test %d: failed with different error, expected: '%v', found:'%v'.", i+1, testCase.expectedErr, err)
+			if testCase.expectedErr == nil && err != nil {
+				t.Errorf("should succeed but failed with %v", err)
 			}
-		}
+			if err == nil {
+				if sameAddr != testCase.sameAddr {
+					t.Errorf("expected: %v, found: %v", testCase.sameAddr, sameAddr)
+				}
+			} else {
+				if err.Error() != testCase.expectedErr.Error() {
+					t.Errorf("failed with different error, expected: '%v', found:'%v'.",
+						testCase.expectedErr, err)
+				}
+			}
+		})
 	}
 }
+
 func TestIsHostIP(t *testing.T) {
 	testCases := []struct {
 		args           string

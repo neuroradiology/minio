@@ -1,234 +1,257 @@
-/*
- * MinIO Cloud Storage, (C) 2018, 2019 MinIO, Inc.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// Copyright (c) 2015-2021 MinIO, Inc.
+//
+// This file is part of MinIO Object Storage stack
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 package cmd
 
 import (
-	"encoding/xml"
 	"net/http"
 
-	"github.com/gorilla/mux"
-	"github.com/minio/minio/pkg/policy"
+	"github.com/minio/minio/internal/logger"
+	"github.com/minio/mux"
+	"github.com/minio/pkg/v3/policy"
 )
 
 // Data types used for returning dummy tagging XML.
 // These variables shouldn't be used elsewhere.
 // They are only defined to be used in this file alone.
 
-type tagging struct {
-	XMLName xml.Name `xml:"Tagging"`
-	TagSet  tagSet   `xml:"TagSet"`
-}
-
-type tagSet struct {
-	Tag []tagElem `xml:"Tag"`
-}
-
-type tagElem struct {
-	Key   string `xml:"Key"`
-	Value string `xml:"Value"`
-}
-
 // GetBucketWebsite  - GET bucket website, a dummy api
 func (api objectAPIHandlers) GetBucketWebsiteHandler(w http.ResponseWriter, r *http.Request) {
-	writeSuccessResponseHeadersOnly(w)
-	w.(http.Flusher).Flush()
-}
+	ctx := newContext(r, w, "GetBucketWebsite")
 
-// GetBucketVersioning - GET bucket versioning, a dummy api
-func (api objectAPIHandlers) GetBucketVersioningHandler(w http.ResponseWriter, r *http.Request) {
-	writeSuccessResponseHeadersOnly(w)
-	w.(http.Flusher).Flush()
+	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
+
+	vars := mux.Vars(r)
+	bucket := vars["bucket"]
+
+	objAPI := api.ObjectAPI()
+	if objAPI == nil {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrServerNotInitialized), r.URL)
+		return
+	}
+
+	// Allow GetBucketWebsite if policy action is set, since this is a dummy call
+	// we are simply re-purposing the bucketPolicyAction.
+	if s3Error := checkRequestAuthType(ctx, r, policy.GetBucketPolicyAction, bucket, ""); s3Error != ErrNone {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
+		return
+	}
+
+	// Validate if bucket exists, before proceeding further...
+	_, err := objAPI.GetBucketInfo(ctx, bucket, BucketOptions{})
+	if err != nil {
+		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
+		return
+	}
+
+	writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrNoSuchWebsiteConfiguration), r.URL)
 }
 
 // GetBucketAccelerate  - GET bucket accelerate, a dummy api
 func (api objectAPIHandlers) GetBucketAccelerateHandler(w http.ResponseWriter, r *http.Request) {
-	writeSuccessResponseHeadersOnly(w)
-	w.(http.Flusher).Flush()
+	ctx := newContext(r, w, "GetBucketAccelerate")
+
+	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
+
+	vars := mux.Vars(r)
+	bucket := vars["bucket"]
+
+	objAPI := api.ObjectAPI()
+	if objAPI == nil {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrServerNotInitialized), r.URL)
+		return
+	}
+
+	// Allow GetBucketAccelerate if policy action is set, since this is a dummy call
+	// we are simply re-purposing the bucketPolicyAction.
+	if s3Error := checkRequestAuthType(ctx, r, policy.GetBucketPolicyAction, bucket, ""); s3Error != ErrNone {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
+		return
+	}
+
+	// Validate if bucket exists, before proceeding further...
+	_, err := objAPI.GetBucketInfo(ctx, bucket, BucketOptions{})
+	if err != nil {
+		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
+		return
+	}
+
+	const accelerateDefaultConfig = `<?xml version="1.0" encoding="UTF-8"?><AccelerateConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"/>`
+	writeSuccessResponseXML(w, []byte(accelerateDefaultConfig))
 }
 
 // GetBucketRequestPaymentHandler - GET bucket requestPayment, a dummy api
 func (api objectAPIHandlers) GetBucketRequestPaymentHandler(w http.ResponseWriter, r *http.Request) {
-	writeSuccessResponseHeadersOnly(w)
-	w.(http.Flusher).Flush()
+	ctx := newContext(r, w, "GetBucketRequestPayment")
+
+	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
+
+	vars := mux.Vars(r)
+	bucket := vars["bucket"]
+
+	objAPI := api.ObjectAPI()
+	if objAPI == nil {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrServerNotInitialized), r.URL)
+		return
+	}
+
+	// Allow GetBucketRequestPaymentHandler if policy action is set, since this is a dummy call
+	// we are simply re-purposing the bucketPolicyAction.
+	if s3Error := checkRequestAuthType(ctx, r, policy.GetBucketPolicyAction, bucket, ""); s3Error != ErrNone {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
+		return
+	}
+
+	// Validate if bucket exists, before proceeding further...
+	_, err := objAPI.GetBucketInfo(ctx, bucket, BucketOptions{})
+	if err != nil {
+		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
+		return
+	}
+
+	const requestPaymentDefaultConfig = `<?xml version="1.0" encoding="UTF-8"?><RequestPaymentConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Payer>BucketOwner</Payer></RequestPaymentConfiguration>`
+
+	writeSuccessResponseXML(w, []byte(requestPaymentDefaultConfig))
 }
 
 // GetBucketLoggingHandler - GET bucket logging, a dummy api
 func (api objectAPIHandlers) GetBucketLoggingHandler(w http.ResponseWriter, r *http.Request) {
-	writeSuccessResponseHeadersOnly(w)
-	w.(http.Flusher).Flush()
-}
+	ctx := newContext(r, w, "GetBucketLogging")
 
-// GetBucketLifecycleHandler - GET bucket lifecycle, a dummy api
-func (api objectAPIHandlers) GetBucketLifecycleHandler(w http.ResponseWriter, r *http.Request) {
-	writeSuccessResponseHeadersOnly(w)
-	w.(http.Flusher).Flush()
-}
+	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
 
-// GetBucketReplicationHandler - GET bucket replication, a dummy api
-func (api objectAPIHandlers) GetBucketReplicationHandler(w http.ResponseWriter, r *http.Request) {
-	writeSuccessResponseHeadersOnly(w)
-	w.(http.Flusher).Flush()
-}
+	vars := mux.Vars(r)
+	bucket := vars["bucket"]
 
-// DeleteBucketTaggingHandler - DELETE bucket tagging, a dummy api
-func (api objectAPIHandlers) DeleteBucketTaggingHandler(w http.ResponseWriter, r *http.Request) {
-	writeSuccessResponseHeadersOnly(w)
-	w.(http.Flusher).Flush()
+	objAPI := api.ObjectAPI()
+	if objAPI == nil {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrServerNotInitialized), r.URL)
+		return
+	}
+
+	// Allow GetBucketLoggingHandler if policy action is set, since this is a dummy call
+	// we are simply re-purposing the bucketPolicyAction.
+	if s3Error := checkRequestAuthType(ctx, r, policy.GetBucketPolicyAction, bucket, ""); s3Error != ErrNone {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
+		return
+	}
+
+	// Validate if bucket exists, before proceeding further...
+	_, err := objAPI.GetBucketInfo(ctx, bucket, BucketOptions{})
+	if err != nil {
+		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
+		return
+	}
+
+	const loggingDefaultConfig = `<?xml version="1.0" encoding="UTF-8"?><BucketLoggingStatus xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><!--<LoggingEnabled><TargetBucket>myLogsBucket</TargetBucket><TargetPrefix>add/this/prefix/to/my/log/files/access_log-</TargetPrefix></LoggingEnabled>--></BucketLoggingStatus>`
+	writeSuccessResponseXML(w, []byte(loggingDefaultConfig))
 }
 
 // DeleteBucketWebsiteHandler - DELETE bucket website, a dummy api
 func (api objectAPIHandlers) DeleteBucketWebsiteHandler(w http.ResponseWriter, r *http.Request) {
 	writeSuccessResponseHeadersOnly(w)
-	w.(http.Flusher).Flush()
 }
-
-type allowedMethod string
-
-// Define strings
-const (
-	GET    allowedMethod = http.MethodGet
-	PUT    allowedMethod = http.MethodPut
-	HEAD   allowedMethod = http.MethodHead
-	POST   allowedMethod = http.MethodPost
-	DELETE allowedMethod = http.MethodDelete
-)
 
 // GetBucketCorsHandler - GET bucket cors, a dummy api
 func (api objectAPIHandlers) GetBucketCorsHandler(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "GetBucketCorsHandler")
+	ctx := newContext(r, w, "GetBucketCors")
 
-	type corsRule struct {
-		AllowedHeaders []string        `xml:"AllowedHeaders"`
-		AllowedMethods []allowedMethod `xml:"AllowedMethod"`
-		AllowedOrigins []string        `xml:"AllowedOrigin"`
-		ExposeHeaders  []string        `xml:"ExposeHeader"`
-		MaxAgeSeconds  int64           `xml:"MaxAgeSeconds"`
-	}
-
-	type corsConfiguration struct {
-		XMLName  xml.Name   `xml:"CORSConfiguration"`
-		CorsRule []corsRule `xml:"CORSRule"`
-	}
+	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
 
 	vars := mux.Vars(r)
 	bucket := vars["bucket"]
 
 	objAPI := api.ObjectAPI()
 	if objAPI == nil {
-		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrServerNotInitialized), r.URL, guessIsBrowserReq(r))
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrServerNotInitialized), r.URL)
 		return
 	}
 
-	// Allow getBucketCors if policy action is set, since this is a dummy call
-	// we are simply re-purposing the bucketPolicyAction.
-	if s3Error := checkRequestAuthType(ctx, r, policy.GetBucketPolicyAction, bucket, ""); s3Error != ErrNone {
-		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL, guessIsBrowserReq(r))
+	if s3Error := checkRequestAuthType(ctx, r, policy.GetBucketCorsAction, bucket, ""); s3Error != ErrNone {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
 		return
 	}
 
 	// Validate if bucket exists, before proceeding further...
-	_, err := objAPI.GetBucketInfo(ctx, bucket)
+	_, err := objAPI.GetBucketInfo(ctx, bucket, BucketOptions{})
 	if err != nil {
-		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL, guessIsBrowserReq(r))
+		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
 
-	cors := &corsConfiguration{}
-	if err := xml.NewEncoder(w).Encode(cors); err != nil {
-		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL, guessIsBrowserReq(r))
-		return
-	}
-
-	w.(http.Flusher).Flush()
+	writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrNoSuchCORSConfiguration), r.URL)
 }
 
-// GetBucketTaggingHandler - GET bucket tagging, a dummy api
-func (api objectAPIHandlers) GetBucketTaggingHandler(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "GetBucketTagging")
+// PutBucketCorsHandler - PUT bucket cors, a dummy api
+func (api objectAPIHandlers) PutBucketCorsHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := newContext(r, w, "PutBucketCors")
+
+	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
 
 	vars := mux.Vars(r)
 	bucket := vars["bucket"]
 
 	objAPI := api.ObjectAPI()
 	if objAPI == nil {
-		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrServerNotInitialized), r.URL, guessIsBrowserReq(r))
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrServerNotInitialized), r.URL)
 		return
 	}
 
-	// Allow getBucketTagging if policy action is set, since this is a dummy call
-	// we are simply re-purposing the bucketPolicyAction.
-	if s3Error := checkRequestAuthType(ctx, r, policy.GetBucketPolicyAction, bucket, ""); s3Error != ErrNone {
-		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL, guessIsBrowserReq(r))
+	if s3Error := checkRequestAuthType(ctx, r, policy.PutBucketCorsAction, bucket, ""); s3Error != ErrNone {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
 		return
 	}
 
 	// Validate if bucket exists, before proceeding further...
-	_, err := objAPI.GetBucketInfo(ctx, bucket)
+	_, err := objAPI.GetBucketInfo(ctx, bucket, BucketOptions{})
 	if err != nil {
-		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL, guessIsBrowserReq(r))
+		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
 
-	tags := &tagging{}
-	tags.TagSet.Tag = append(tags.TagSet.Tag, tagElem{})
-
-	if err := xml.NewEncoder(w).Encode(tags); err != nil {
-		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL, guessIsBrowserReq(r))
-		return
-	}
-
-	w.(http.Flusher).Flush()
+	writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrNotImplemented), r.URL)
 }
 
-// GetObjectTaggingHandler - GET object tagging, a dummy api
-func (api objectAPIHandlers) GetObjectTaggingHandler(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "GetObjectTagging")
+// DeleteBucketCorsHandler - DELETE bucket cors, a dummy api
+func (api objectAPIHandlers) DeleteBucketCorsHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := newContext(r, w, "DeleteBucketCors")
+
+	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
 
 	vars := mux.Vars(r)
 	bucket := vars["bucket"]
-	object := vars["object"]
 
 	objAPI := api.ObjectAPI()
 	if objAPI == nil {
-		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrServerNotInitialized), r.URL, guessIsBrowserReq(r))
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrServerNotInitialized), r.URL)
 		return
 	}
 
-	// Allow getObjectTagging if policy action is set, since this is a dummy call
-	// we are simply re-purposing the bucketPolicyAction.
-	if s3Error := checkRequestAuthType(ctx, r, policy.GetBucketPolicyAction, bucket, ""); s3Error != ErrNone {
-		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL, guessIsBrowserReq(r))
+	if s3Error := checkRequestAuthType(ctx, r, policy.DeleteBucketCorsAction, bucket, ""); s3Error != ErrNone {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
 		return
 	}
 
-	// Validate if object exists, before proceeding further...
-	_, err := objAPI.GetObjectInfo(ctx, bucket, object, ObjectOptions{})
+	// Validate if bucket exists, before proceeding further...
+	_, err := objAPI.GetBucketInfo(ctx, bucket, BucketOptions{})
 	if err != nil {
-		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL, guessIsBrowserReq(r))
+		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
 
-	tags := &tagging{}
-	tags.TagSet.Tag = append(tags.TagSet.Tag, tagElem{})
-
-	if err := xml.NewEncoder(w).Encode(tags); err != nil {
-		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL, guessIsBrowserReq(r))
-		return
-	}
-
-	w.(http.Flusher).Flush()
+	writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrNotImplemented), r.URL)
 }

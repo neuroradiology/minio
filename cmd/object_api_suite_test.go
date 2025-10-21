@@ -1,30 +1,35 @@
-/*
- * MinIO Cloud Storage, (C) 2015, 2016, 2017 MinIO, Inc.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// Copyright (c) 2015-2021 MinIO, Inc.
+//
+// This file is part of MinIO Object Storage stack
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 package cmd
 
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"math/rand"
 	"strconv"
+	"strings"
 	"testing"
+	"time"
 
-	humanize "github.com/dustin/go-humanize"
+	"github.com/dustin/go-humanize"
+	"github.com/minio/minio/internal/kms"
 )
 
 // Return pointer to testOneByteReadEOF{}
@@ -68,37 +73,37 @@ func (r *testOneByteReadNoEOF) Read(p []byte) (n int, err error) {
 	return n, nil
 }
 
-type ObjectLayerAPISuite struct{}
-
-// Wrapper for calling testMakeBucket for both XL and FS.
-func (s *ObjectLayerAPISuite) TestMakeBucket(t *testing.T) {
+// Wrapper for calling testMakeBucket for both Erasure and FS.
+func TestMakeBucket(t *testing.T) {
 	ExecObjectLayerTest(t, testMakeBucket)
 }
 
 // Tests validate bucket creation.
 func testMakeBucket(obj ObjectLayer, instanceType string, t TestErrHandler) {
-	err := obj.MakeBucketWithLocation(context.Background(), "bucket-unknown", "")
+	err := obj.MakeBucket(context.Background(), "bucket-unknown", MakeBucketOptions{})
 	if err != nil {
 		t.Fatalf("%s: <ERROR> %s", instanceType, err)
 	}
 }
 
-// Wrapper for calling testMultipartObjectCreation for both XL and FS.
-func (s *ObjectLayerAPISuite) TestMultipartObjectCreation(t *testing.T) {
-	ExecObjectLayerTest(t, testMultipartObjectCreation)
+// Wrapper for calling testMultipartObjectCreation for both Erasure and FS.
+func TestMultipartObjectCreation(t *testing.T) {
+	ExecExtendedObjectLayerTest(t, testMultipartObjectCreation)
 }
 
 // Tests validate creation of part files during Multipart operation.
 func testMultipartObjectCreation(obj ObjectLayer, instanceType string, t TestErrHandler) {
 	var opts ObjectOptions
-	err := obj.MakeBucketWithLocation(context.Background(), "bucket", "")
+	err := obj.MakeBucket(context.Background(), "bucket", MakeBucketOptions{})
 	if err != nil {
 		t.Fatalf("%s: <ERROR> %s", instanceType, err)
 	}
-	uploadID, err := obj.NewMultipartUpload(context.Background(), "bucket", "key", opts)
+	res, err := obj.NewMultipartUpload(context.Background(), "bucket", "key", opts)
 	if err != nil {
 		t.Fatalf("%s: <ERROR> %s", instanceType, err)
 	}
+	uploadID := res.UploadID
+
 	// Create a byte array of 5MiB.
 	data := bytes.Repeat([]byte("0123456789abcdef"), 5*humanize.MiByte/16)
 	completedParts := CompleteMultipartUpload{}
@@ -127,22 +132,23 @@ func testMultipartObjectCreation(obj ObjectLayer, instanceType string, t TestErr
 	}
 }
 
-// Wrapper for calling testMultipartObjectAbort for both XL and FS.
-func (s *ObjectLayerAPISuite) TestMultipartObjectAbort(t *testing.T) {
+// Wrapper for calling testMultipartObjectAbort for both Erasure and FS.
+func TestMultipartObjectAbort(t *testing.T) {
 	ExecObjectLayerTest(t, testMultipartObjectAbort)
 }
 
 // Tests validate abortion of Multipart operation.
 func testMultipartObjectAbort(obj ObjectLayer, instanceType string, t TestErrHandler) {
 	var opts ObjectOptions
-	err := obj.MakeBucketWithLocation(context.Background(), "bucket", "")
+	err := obj.MakeBucket(context.Background(), "bucket", MakeBucketOptions{})
 	if err != nil {
 		t.Fatalf("%s: <ERROR> %s", instanceType, err)
 	}
-	uploadID, err := obj.NewMultipartUpload(context.Background(), "bucket", "key", opts)
+	res, err := obj.NewMultipartUpload(context.Background(), "bucket", "key", opts)
 	if err != nil {
 		t.Fatalf("%s: <ERROR> %s", instanceType, err)
 	}
+	uploadID := res.UploadID
 
 	parts := make(map[int]string)
 	metadata := make(map[string]string)
@@ -150,7 +156,7 @@ func testMultipartObjectAbort(obj ObjectLayer, instanceType string, t TestErrHan
 		randomPerm := rand.Perm(10)
 		randomString := ""
 		for _, num := range randomPerm {
-			randomString = randomString + strconv.Itoa(num)
+			randomString += strconv.Itoa(num)
 		}
 
 		expectedETaghex := getMD5Hash([]byte(randomString))
@@ -166,30 +172,30 @@ func testMultipartObjectAbort(obj ObjectLayer, instanceType string, t TestErrHan
 		}
 		parts[i] = expectedETaghex
 	}
-	err = obj.AbortMultipartUpload(context.Background(), "bucket", "key", uploadID)
+	err = obj.AbortMultipartUpload(context.Background(), "bucket", "key", uploadID, ObjectOptions{})
 	if err != nil {
 		t.Fatalf("%s: <ERROR> %s", instanceType, err)
 	}
 }
 
-// Wrapper for calling testMultipleObjectCreation for both XL and FS.
-func (s *ObjectLayerAPISuite) TestMultipleObjectCreation(t *testing.T) {
-	ExecObjectLayerTest(t, testMultipleObjectCreation)
+// Wrapper for calling testMultipleObjectCreation for both Erasure and FS.
+func TestMultipleObjectCreation(t *testing.T) {
+	ExecExtendedObjectLayerTest(t, testMultipleObjectCreation)
 }
 
 // Tests validate object creation.
 func testMultipleObjectCreation(obj ObjectLayer, instanceType string, t TestErrHandler) {
 	objects := make(map[string][]byte)
 	var opts ObjectOptions
-	err := obj.MakeBucketWithLocation(context.Background(), "bucket", "")
+	err := obj.MakeBucket(context.Background(), "bucket", MakeBucketOptions{})
 	if err != nil {
 		t.Fatalf("%s: <ERROR> %s", instanceType, err)
 	}
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		randomPerm := rand.Perm(100)
 		randomString := ""
 		for _, num := range randomPerm {
-			randomString = randomString + strconv.Itoa(num)
+			randomString += strconv.Itoa(num)
 		}
 
 		expectedETaghex := getMD5Hash([]byte(randomString))
@@ -210,7 +216,7 @@ func testMultipleObjectCreation(obj ObjectLayer, instanceType string, t TestErrH
 
 	for key, value := range objects {
 		var byteBuffer bytes.Buffer
-		err = obj.GetObject(context.Background(), "bucket", key, 0, int64(len(value)), &byteBuffer, "", opts)
+		err = GetObject(context.Background(), obj, "bucket", key, 0, int64(len(value)), &byteBuffer, "", opts)
 		if err != nil {
 			t.Fatalf("%s: <ERROR> %s", instanceType, err)
 		}
@@ -225,18 +231,17 @@ func testMultipleObjectCreation(obj ObjectLayer, instanceType string, t TestErrH
 		if objInfo.Size != int64(len(value)) {
 			t.Errorf("%s: Size mismatch of the GetObject data.", instanceType)
 		}
-
 	}
 }
 
-// Wrapper for calling TestPaging for both XL and FS.
-func (s *ObjectLayerAPISuite) TestPaging(t *testing.T) {
+// Wrapper for calling TestPaging for both Erasure and FS.
+func TestPaging(t *testing.T) {
 	ExecObjectLayerTest(t, testPaging)
 }
 
 // Tests validate creation of objects and the order of listing using various filters for ListObjects operation.
 func testPaging(obj ObjectLayer, instanceType string, t TestErrHandler) {
-	obj.MakeBucketWithLocation(context.Background(), "bucket", "")
+	obj.MakeBucket(context.Background(), "bucket", MakeBucketOptions{})
 	result, err := obj.ListObjects(context.Background(), "bucket", "", "", "", 0)
 	if err != nil {
 		t.Fatalf("%s: <ERROR> %s", instanceType, err)
@@ -251,7 +256,7 @@ func testPaging(obj ObjectLayer, instanceType string, t TestErrHandler) {
 	uploadContent := "The specified multipart upload does not exist. The upload ID might be invalid, or the multipart upload might have been aborted or completed."
 	var opts ObjectOptions
 	// check before paging occurs.
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		key := "obj" + strconv.Itoa(i)
 		_, err = obj.PutObject(context.Background(), "bucket", key, mustGetPutObjReader(t, bytes.NewBufferString(uploadContent), int64(len(uploadContent)), "", ""), opts)
 		if err != nil {
@@ -340,7 +345,7 @@ func testPaging(obj ObjectLayer, instanceType string, t TestErrHandler) {
 		if err != nil {
 			t.Fatalf("%s: <ERROR> %s", instanceType, err)
 		}
-		result, err = obj.ListObjects(context.Background(), "bucket", "this/is/", "", "/", 10)
+		result, err = obj.ListObjects(context.Background(), "bucket", "this/is/", "", SlashSeparator, 10)
 		if err != nil {
 			t.Fatalf("%s: <ERROR> %s", instanceType, err)
 		}
@@ -354,7 +359,7 @@ func testPaging(obj ObjectLayer, instanceType string, t TestErrHandler) {
 
 	// check delimited results with delimiter without prefix.
 	{
-		result, err = obj.ListObjects(context.Background(), "bucket", "", "", "/", 1000)
+		result, err = obj.ListObjects(context.Background(), "bucket", "", "", SlashSeparator, 1000)
 		if err != nil {
 			t.Fatalf("%s: <ERROR> %s", instanceType, err)
 		}
@@ -381,7 +386,6 @@ func testPaging(obj ObjectLayer, instanceType string, t TestErrHandler) {
 
 	// check results with Marker.
 	{
-
 		result, err = obj.ListObjects(context.Background(), "bucket", "", "newPrefix", "", 3)
 		if err != nil {
 			t.Fatalf("%s: <ERROR> %s", instanceType, err)
@@ -431,16 +435,56 @@ func testPaging(obj ObjectLayer, instanceType string, t TestErrHandler) {
 			t.Errorf("%s: Expected the object name to be `%s`, but instead found `%s`", instanceType, "newPrefix2", result.Objects[0].Name)
 		}
 	}
+
+	// check paging works.
+	ag := []string{"a", "b", "c", "d", "e", "f", "g"}
+	checkObjCount := make(map[string]int)
+	for i := range 7 {
+		dirName := strings.Repeat(ag[i], 3)
+		key := fmt.Sprintf("testPrefix/%s/obj%s", dirName, dirName)
+		checkObjCount[key]++
+		_, err = obj.PutObject(context.Background(), "bucket", key, mustGetPutObjReader(t, bytes.NewBufferString(uploadContent), int64(len(uploadContent)), "", ""), opts)
+		if err != nil {
+			t.Fatalf("%s: <ERROR> %s", instanceType, err)
+		}
+	}
+	{
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+		defer cancel()
+		token := ""
+		for ctx.Err() == nil {
+			result, err := obj.ListObjectsV2(ctx, "bucket", "testPrefix", token, "", 2, false, "")
+			if err != nil {
+				t.Fatalf("%s: <ERROR> %s", instanceType, err)
+			}
+			token = result.NextContinuationToken
+			if len(result.Objects) == 0 {
+				break
+			}
+			for _, obj := range result.Objects {
+				checkObjCount[obj.Name]--
+			}
+			if token == "" {
+				break
+			}
+		}
+		for key, value := range checkObjCount {
+			if value != 0 {
+				t.Errorf("%s: Expected value of objects to be %d, instead found to be %d", instanceType, 0, value)
+			}
+			delete(checkObjCount, key)
+		}
+	}
 }
 
-// Wrapper for calling testObjectOverwriteWorks for both XL and FS.
-func (s *ObjectLayerAPISuite) TestObjectOverwriteWorks(t *testing.T) {
+// Wrapper for calling testObjectOverwriteWorks for both Erasure and FS.
+func TestObjectOverwriteWorks(t *testing.T) {
 	ExecObjectLayerTest(t, testObjectOverwriteWorks)
 }
 
 // Tests validate overwriting of an existing object.
 func testObjectOverwriteWorks(obj ObjectLayer, instanceType string, t TestErrHandler) {
-	err := obj.MakeBucketWithLocation(context.Background(), "bucket", "")
+	err := obj.MakeBucket(context.Background(), "bucket", MakeBucketOptions{})
 	if err != nil {
 		t.Fatalf("%s: <ERROR> %s", instanceType, err)
 	}
@@ -461,7 +505,7 @@ func testObjectOverwriteWorks(obj ObjectLayer, instanceType string, t TestErrHan
 	}
 
 	var bytesBuffer bytes.Buffer
-	err = obj.GetObject(context.Background(), "bucket", "object", 0, length, &bytesBuffer, "", opts)
+	err = GetObject(context.Background(), obj, "bucket", "object", 0, length, &bytesBuffer, "", opts)
 	if err != nil {
 		t.Fatalf("%s: <ERROR> %s", instanceType, err)
 	}
@@ -470,13 +514,13 @@ func testObjectOverwriteWorks(obj ObjectLayer, instanceType string, t TestErrHan
 	}
 }
 
-// Wrapper for calling testNonExistantBucketOperations for both XL and FS.
-func (s *ObjectLayerAPISuite) TestNonExistantBucketOperations(t *testing.T) {
-	ExecObjectLayerTest(t, testNonExistantBucketOperations)
+// Wrapper for calling testNonExistentBucketOperations for both Erasure and FS.
+func TestNonExistentBucketOperations(t *testing.T) {
+	ExecObjectLayerTest(t, testNonExistentBucketOperations)
 }
 
 // Tests validate that bucket operation on non-existent bucket fails.
-func testNonExistantBucketOperations(obj ObjectLayer, instanceType string, t TestErrHandler) {
+func testNonExistentBucketOperations(obj ObjectLayer, instanceType string, t TestErrHandler) {
 	var opts ObjectOptions
 	_, err := obj.PutObject(context.Background(), "bucket1", "object", mustGetPutObjReader(t, bytes.NewBufferString("one"), int64(len("one")), "", ""), opts)
 	if err == nil {
@@ -487,18 +531,18 @@ func testNonExistantBucketOperations(obj ObjectLayer, instanceType string, t Tes
 	}
 }
 
-// Wrapper for calling testBucketRecreateFails for both XL and FS.
-func (s *ObjectLayerAPISuite) TestBucketRecreateFails(t *testing.T) {
+// Wrapper for calling testBucketRecreateFails for both Erasure and FS.
+func TestBucketRecreateFails(t *testing.T) {
 	ExecObjectLayerTest(t, testBucketRecreateFails)
 }
 
 // Tests validate that recreation of the bucket fails.
 func testBucketRecreateFails(obj ObjectLayer, instanceType string, t TestErrHandler) {
-	err := obj.MakeBucketWithLocation(context.Background(), "string", "")
+	err := obj.MakeBucket(context.Background(), "string", MakeBucketOptions{})
 	if err != nil {
 		t.Fatalf("%s: <ERROR> %s", instanceType, err)
 	}
-	err = obj.MakeBucketWithLocation(context.Background(), "string", "")
+	err = obj.MakeBucket(context.Background(), "string", MakeBucketOptions{})
 	if err == nil {
 		t.Fatalf("%s: Expected error but found nil.", instanceType)
 	}
@@ -508,9 +552,115 @@ func testBucketRecreateFails(obj ObjectLayer, instanceType string, t TestErrHand
 	}
 }
 
-// Wrapper for calling testPutObject for both XL and FS.
-func (s *ObjectLayerAPISuite) TestPutObject(t *testing.T) {
-	ExecObjectLayerTest(t, testPutObject)
+func enableCompression(t *testing.T, encrypt bool, mimeTypes []string, extensions []string) {
+	// Enable compression and exec...
+	globalCompressConfigMu.Lock()
+	globalCompressConfig.Enabled = true
+	globalCompressConfig.MimeTypes = mimeTypes
+	globalCompressConfig.Extensions = extensions
+	globalCompressConfig.AllowEncrypted = encrypt
+	globalCompressConfigMu.Unlock()
+	if encrypt {
+		globalAutoEncryption = encrypt
+		KMS, err := kms.ParseSecretKey("my-minio-key:5lF+0pJM0OWwlQrvK2S/I7W9mO4a6rJJI7wzj7v09cw=")
+		if err != nil {
+			t.Fatal(err)
+		}
+		GlobalKMS = KMS
+	}
+}
+
+func enableEncryption(t *testing.T) {
+	// Exec with default settings...
+	globalCompressConfigMu.Lock()
+	globalCompressConfig.Enabled = false
+	globalCompressConfigMu.Unlock()
+
+	globalAutoEncryption = true
+	KMS, err := kms.ParseSecretKey("my-minio-key:5lF+0pJM0OWwlQrvK2S/I7W9mO4a6rJJI7wzj7v09cw=")
+	if err != nil {
+		t.Fatal(err)
+	}
+	GlobalKMS = KMS
+}
+
+func resetCompressEncryption() {
+	// Reset...
+	globalCompressConfigMu.Lock()
+	globalCompressConfig.Enabled = false
+	globalCompressConfig.AllowEncrypted = false
+	globalCompressConfigMu.Unlock()
+	globalAutoEncryption = false
+	GlobalKMS = nil
+}
+
+func execExtended(t *testing.T, fn func(t *testing.T, init func(), bucketOptions MakeBucketOptions)) {
+	// Exec with default settings...
+	resetCompressEncryption()
+	t.Run("default", func(t *testing.T) {
+		fn(t, nil, MakeBucketOptions{})
+	})
+	t.Run("default+versioned", func(t *testing.T) {
+		fn(t, nil, MakeBucketOptions{VersioningEnabled: true})
+	})
+
+	t.Run("compressed", func(t *testing.T) {
+		fn(t, func() {
+			resetCompressEncryption()
+			enableCompression(t, false, []string{"*"}, []string{"*"})
+		}, MakeBucketOptions{})
+	})
+	t.Run("compressed+versioned", func(t *testing.T) {
+		fn(t, func() {
+			resetCompressEncryption()
+			enableCompression(t, false, []string{"*"}, []string{"*"})
+		}, MakeBucketOptions{
+			VersioningEnabled: true,
+		})
+	})
+
+	t.Run("encrypted", func(t *testing.T) {
+		fn(t, func() {
+			resetCompressEncryption()
+			enableEncryption(t)
+		}, MakeBucketOptions{})
+	})
+	t.Run("encrypted+versioned", func(t *testing.T) {
+		fn(t, func() {
+			resetCompressEncryption()
+			enableEncryption(t)
+		}, MakeBucketOptions{
+			VersioningEnabled: true,
+		})
+	})
+
+	t.Run("compressed+encrypted", func(t *testing.T) {
+		fn(t, func() {
+			resetCompressEncryption()
+			enableCompression(t, true, []string{"*"}, []string{"*"})
+		}, MakeBucketOptions{})
+	})
+	t.Run("compressed+encrypted+versioned", func(t *testing.T) {
+		fn(t, func() {
+			resetCompressEncryption()
+			enableCompression(t, true, []string{"*"}, []string{"*"})
+		}, MakeBucketOptions{
+			VersioningEnabled: true,
+		})
+	})
+}
+
+// ExecExtendedObjectLayerTest will execute the tests with combinations of encrypted & compressed.
+// This can be used to test functionality when reading and writing data.
+func ExecExtendedObjectLayerTest(t *testing.T, objTest objTestType) {
+	execExtended(t, func(t *testing.T, init func(), bucketOptions MakeBucketOptions) {
+		ExecObjectLayerTest(t, objTest)
+	})
+}
+
+// Wrapper for calling testPutObject for both Erasure and FS.
+func TestPutObject(t *testing.T) {
+	ExecExtendedObjectLayerTest(t, testPutObject)
 }
 
 // Tests validate PutObject without prefix.
@@ -519,7 +669,7 @@ func testPutObject(obj ObjectLayer, instanceType string, t TestErrHandler) {
 	length := int64(len(content))
 	readerEOF := newTestReaderEOF(content)
 	readerNoEOF := newTestReaderNoEOF(content)
-	err := obj.MakeBucketWithLocation(context.Background(), "bucket", "")
+	err := obj.MakeBucket(context.Background(), "bucket", MakeBucketOptions{})
 	if err != nil {
 		t.Fatalf("%s: <ERROR> %s", instanceType, err)
 	}
@@ -530,7 +680,7 @@ func testPutObject(obj ObjectLayer, instanceType string, t TestErrHandler) {
 	if err != nil {
 		t.Fatalf("%s: <ERROR> %s", instanceType, err)
 	}
-	err = obj.GetObject(context.Background(), "bucket", "object", 0, length, &bytesBuffer1, "", opts)
+	err = GetObject(context.Background(), obj, "bucket", "object", 0, length, &bytesBuffer1, "", opts)
 	if err != nil {
 		t.Fatalf("%s: <ERROR> %s", instanceType, err)
 	}
@@ -543,7 +693,7 @@ func testPutObject(obj ObjectLayer, instanceType string, t TestErrHandler) {
 	if err != nil {
 		t.Fatalf("%s: <ERROR> %s", instanceType, err)
 	}
-	err = obj.GetObject(context.Background(), "bucket", "object", 0, length, &bytesBuffer2, "", opts)
+	err = GetObject(context.Background(), obj, "bucket", "object", 0, length, &bytesBuffer2, "", opts)
 	if err != nil {
 		t.Fatalf("%s: <ERROR> %s", instanceType, err)
 	}
@@ -552,14 +702,14 @@ func testPutObject(obj ObjectLayer, instanceType string, t TestErrHandler) {
 	}
 }
 
-// Wrapper for calling testPutObjectInSubdir for both XL and FS.
-func (s *ObjectLayerAPISuite) TestPutObjectInSubdir(t *testing.T) {
-	ExecObjectLayerTest(t, testPutObjectInSubdir)
+// Wrapper for calling testPutObjectInSubdir for both Erasure and FS.
+func TestPutObjectInSubdir(t *testing.T) {
+	ExecExtendedObjectLayerTest(t, testPutObjectInSubdir)
 }
 
 // Tests validate PutObject with subdirectory prefix.
 func testPutObjectInSubdir(obj ObjectLayer, instanceType string, t TestErrHandler) {
-	err := obj.MakeBucketWithLocation(context.Background(), "bucket", "")
+	err := obj.MakeBucket(context.Background(), "bucket", MakeBucketOptions{})
 	if err != nil {
 		t.Fatalf("%s: <ERROR> %s", instanceType, err)
 	}
@@ -574,7 +724,7 @@ func testPutObjectInSubdir(obj ObjectLayer, instanceType string, t TestErrHandle
 	}
 
 	var bytesBuffer bytes.Buffer
-	err = obj.GetObject(context.Background(), "bucket", "dir1/dir2/object", 0, length, &bytesBuffer, "", opts)
+	err = GetObject(context.Background(), obj, "bucket", "dir1/dir2/object", 0, length, &bytesBuffer, "", opts)
 	if err != nil {
 		t.Fatalf("%s: <ERROR> %s", instanceType, err)
 	}
@@ -584,15 +734,15 @@ func testPutObjectInSubdir(obj ObjectLayer, instanceType string, t TestErrHandle
 	}
 }
 
-// Wrapper for calling testListBuckets for both XL and FS.
-func (s *ObjectLayerAPISuite) TestListBuckets(t *testing.T) {
+// Wrapper for calling testListBuckets for both Erasure and FS.
+func TestListBuckets(t *testing.T) {
 	ExecObjectLayerTest(t, testListBuckets)
 }
 
 // Tests validate ListBuckets.
 func testListBuckets(obj ObjectLayer, instanceType string, t TestErrHandler) {
 	// test empty list.
-	buckets, err := obj.ListBuckets(context.Background())
+	buckets, err := obj.ListBuckets(context.Background(), BucketOptions{})
 	if err != nil {
 		t.Fatalf("%s: <ERROR> %s", instanceType, err)
 	}
@@ -601,12 +751,12 @@ func testListBuckets(obj ObjectLayer, instanceType string, t TestErrHandler) {
 	}
 
 	// add one and test exists.
-	err = obj.MakeBucketWithLocation(context.Background(), "bucket1", "")
+	err = obj.MakeBucket(context.Background(), "bucket1", MakeBucketOptions{})
 	if err != nil {
 		t.Fatalf("%s: <ERROR> %s", instanceType, err)
 	}
 
-	buckets, err = obj.ListBuckets(context.Background())
+	buckets, err = obj.ListBuckets(context.Background(), BucketOptions{})
 	if err != nil {
 		t.Fatalf("%s: <ERROR> %s", instanceType, err)
 	}
@@ -615,12 +765,12 @@ func testListBuckets(obj ObjectLayer, instanceType string, t TestErrHandler) {
 	}
 
 	// add two and test exists.
-	err = obj.MakeBucketWithLocation(context.Background(), "bucket2", "")
+	err = obj.MakeBucket(context.Background(), "bucket2", MakeBucketOptions{})
 	if err != nil {
 		t.Fatalf("%s: <ERROR> %s", instanceType, err)
 	}
 
-	buckets, err = obj.ListBuckets(context.Background())
+	buckets, err = obj.ListBuckets(context.Background(), BucketOptions{})
 	if err != nil {
 		t.Fatalf("%s: <ERROR> %s", instanceType, err)
 	}
@@ -629,12 +779,12 @@ func testListBuckets(obj ObjectLayer, instanceType string, t TestErrHandler) {
 	}
 
 	// add three and test exists + prefix.
-	err = obj.MakeBucketWithLocation(context.Background(), "bucket22", "")
+	err = obj.MakeBucket(context.Background(), "bucket22", MakeBucketOptions{})
 	if err != nil {
 		t.Fatalf("%s: <ERROR> %s", instanceType, err)
 	}
 
-	buckets, err = obj.ListBuckets(context.Background())
+	buckets, err = obj.ListBuckets(context.Background(), BucketOptions{})
 	if err != nil {
 		t.Fatalf("%s: <ERROR> %s", instanceType, err)
 	}
@@ -643,8 +793,8 @@ func testListBuckets(obj ObjectLayer, instanceType string, t TestErrHandler) {
 	}
 }
 
-// Wrapper for calling testListBucketsOrder for both XL and FS.
-func (s *ObjectLayerAPISuite) TestListBucketsOrder(t *testing.T) {
+// Wrapper for calling testListBucketsOrder for both Erasure and FS.
+func TestListBucketsOrder(t *testing.T) {
 	ExecObjectLayerTest(t, testListBucketsOrder)
 }
 
@@ -653,15 +803,15 @@ func testListBucketsOrder(obj ObjectLayer, instanceType string, t TestErrHandler
 	// if implementation contains a map, order of map keys will vary.
 	// this ensures they return in the same order each time.
 	// add one and test exists.
-	err := obj.MakeBucketWithLocation(context.Background(), "bucket1", "")
+	err := obj.MakeBucket(context.Background(), "bucket1", MakeBucketOptions{})
 	if err != nil {
 		t.Fatalf("%s: <ERROR> %s", instanceType, err)
 	}
-	err = obj.MakeBucketWithLocation(context.Background(), "bucket2", "")
+	err = obj.MakeBucket(context.Background(), "bucket2", MakeBucketOptions{})
 	if err != nil {
 		t.Fatalf("%s: <ERROR> %s", instanceType, err)
 	}
-	buckets, err := obj.ListBuckets(context.Background())
+	buckets, err := obj.ListBuckets(context.Background(), BucketOptions{})
 	if err != nil {
 		t.Fatalf("%s: <ERROR> %s", instanceType, err)
 	}
@@ -677,13 +827,13 @@ func testListBucketsOrder(obj ObjectLayer, instanceType string, t TestErrHandler
 	}
 }
 
-// Wrapper for calling testListObjectsTestsForNonExistantBucket for both XL and FS.
-func (s *ObjectLayerAPISuite) TestListObjectsTestsForNonExistantBucket(t *testing.T) {
-	ExecObjectLayerTest(t, testListObjectsTestsForNonExistantBucket)
+// Wrapper for calling testListObjectsTestsForNonExistentBucket for both Erasure and FS.
+func TestListObjectsTestsForNonExistentBucket(t *testing.T) {
+	ExecObjectLayerTest(t, testListObjectsTestsForNonExistentBucket)
 }
 
 // Tests validate that ListObjects operation on a non-existent bucket fails as expected.
-func testListObjectsTestsForNonExistantBucket(obj ObjectLayer, instanceType string, t TestErrHandler) {
+func testListObjectsTestsForNonExistentBucket(obj ObjectLayer, instanceType string, t TestErrHandler) {
 	result, err := obj.ListObjects(context.Background(), "bucket", "", "", "", 1000)
 	if err == nil {
 		t.Fatalf("%s: Expected error but found nil.", instanceType)
@@ -699,14 +849,14 @@ func testListObjectsTestsForNonExistantBucket(obj ObjectLayer, instanceType stri
 	}
 }
 
-// Wrapper for calling testNonExistantObjectInBucket for both XL and FS.
-func (s *ObjectLayerAPISuite) TestNonExistantObjectInBucket(t *testing.T) {
-	ExecObjectLayerTest(t, testNonExistantObjectInBucket)
+// Wrapper for calling testNonExistentObjectInBucket for both Erasure and FS.
+func TestNonExistentObjectInBucket(t *testing.T) {
+	ExecObjectLayerTest(t, testNonExistentObjectInBucket)
 }
 
 // Tests validate that GetObject fails on a non-existent bucket as expected.
-func testNonExistantObjectInBucket(obj ObjectLayer, instanceType string, t TestErrHandler) {
-	err := obj.MakeBucketWithLocation(context.Background(), "bucket", "")
+func testNonExistentObjectInBucket(obj ObjectLayer, instanceType string, t TestErrHandler) {
+	err := obj.MakeBucket(context.Background(), "bucket", MakeBucketOptions{})
 	if err != nil {
 		t.Fatalf("%s: <ERROR> %s", instanceType, err)
 	}
@@ -716,8 +866,8 @@ func testNonExistantObjectInBucket(obj ObjectLayer, instanceType string, t TestE
 		t.Fatalf("%s: Expected error but found nil", instanceType)
 	}
 	if isErrObjectNotFound(err) {
-		if err.Error() != "Object not found: bucket#dir1" {
-			t.Errorf("%s: Expected the Error message to be `%s`, but instead found `%s`", instanceType, "Object not found: bucket#dir1", err.Error())
+		if err.Error() != "Object not found: bucket/dir1" {
+			t.Errorf("%s: Expected the Error message to be `%s`, but instead found `%s`", instanceType, "Object not found: bucket/dir1", err.Error())
 		}
 	} else {
 		if err.Error() != "fails" {
@@ -726,15 +876,15 @@ func testNonExistantObjectInBucket(obj ObjectLayer, instanceType string, t TestE
 	}
 }
 
-// Wrapper for calling testGetDirectoryReturnsObjectNotFound for both XL and FS.
-func (s *ObjectLayerAPISuite) TestGetDirectoryReturnsObjectNotFound(t *testing.T) {
+// Wrapper for calling testGetDirectoryReturnsObjectNotFound for both Erasure and FS.
+func TestGetDirectoryReturnsObjectNotFound(t *testing.T) {
 	ExecObjectLayerTest(t, testGetDirectoryReturnsObjectNotFound)
 }
 
 // Tests validate that GetObject on an existing directory fails as expected.
 func testGetDirectoryReturnsObjectNotFound(obj ObjectLayer, instanceType string, t TestErrHandler) {
 	bucketName := "bucket"
-	err := obj.MakeBucketWithLocation(context.Background(), bucketName, "")
+	err := obj.MakeBucket(context.Background(), bucketName, MakeBucketOptions{})
 	if err != nil {
 		t.Fatalf("%s: <ERROR> %s", instanceType, err)
 	}
@@ -742,7 +892,6 @@ func testGetDirectoryReturnsObjectNotFound(obj ObjectLayer, instanceType string,
 	length := int64(len(content))
 	var opts ObjectOptions
 	_, err = obj.PutObject(context.Background(), bucketName, "dir1/dir3/object", mustGetPutObjReader(t, bytes.NewBufferString(content), length, "", ""), opts)
-
 	if err != nil {
 		t.Fatalf("%s: <ERROR> %s", instanceType, err)
 	}
@@ -769,14 +918,14 @@ func testGetDirectoryReturnsObjectNotFound(obj ObjectLayer, instanceType string,
 	}
 }
 
-// Wrapper for calling testContentType for both XL and FS.
-func (s *ObjectLayerAPISuite) TestContentType(t *testing.T) {
+// Wrapper for calling testContentType for both Erasure and FS.
+func TestContentType(t *testing.T) {
 	ExecObjectLayerTest(t, testContentType)
 }
 
 // Test content-type.
 func testContentType(obj ObjectLayer, instanceType string, t TestErrHandler) {
-	err := obj.MakeBucketWithLocation(context.Background(), "bucket", "")
+	err := obj.MakeBucket(context.Background(), "bucket", MakeBucketOptions{})
 	if err != nil {
 		t.Fatalf("%s: <ERROR> %s", instanceType, err)
 	}

@@ -1,18 +1,19 @@
-/*
- * MinIO Cloud Storage, (C) 2018 MinIO, Inc.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// Copyright (c) 2015-2021 MinIO, Inc.
+//
+// This file is part of MinIO Object Storage stack
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 package cmd
 
@@ -20,100 +21,67 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
+	"io"
+	"net/http"
 
-	etcd "github.com/coreos/etcd/clientv3"
-	"github.com/minio/minio/cmd/logger"
-	"github.com/minio/minio/pkg/hash"
+	"github.com/minio/minio/internal/hash"
 )
 
 var errConfigNotFound = errors.New("config file not found")
 
-func readConfig(ctx context.Context, objAPI ObjectLayer, configFile string) ([]byte, error) {
-	var buffer bytes.Buffer
-	// Read entire content by setting size to -1
-	if err := objAPI.GetObject(ctx, minioMetaBucket, configFile, 0, -1, &buffer, "", ObjectOptions{}); err != nil {
-		// Treat object not found as config not found.
-		if isErrObjectNotFound(err) {
-			return nil, errConfigNotFound
-		}
-
-		logger.GetReqInfo(ctx).AppendTags("configFile", configFile)
-		logger.LogIf(ctx, err)
-		return nil, err
-	}
-
-	// Return config not found on empty content.
-	if buffer.Len() == 0 {
-		return nil, errConfigNotFound
-	}
-
-	return buffer.Bytes(), nil
-}
-
-func deleteConfigEtcd(ctx context.Context, client *etcd.Client, configFile string) error {
-	timeoutCtx, cancel := context.WithTimeout(ctx, defaultContextTimeout)
-	defer cancel()
-
-	_, err := client.Delete(timeoutCtx, configFile)
+func readConfigWithMetadata(ctx context.Context, store objectIO, configFile string, opts ObjectOptions) ([]byte, ObjectInfo, error) {
+	r, err := store.GetObjectNInfo(ctx, minioMetaBucket, configFile, nil, http.Header{}, opts)
 	if err != nil {
-		if err == context.DeadlineExceeded {
-			return fmt.Errorf("etcd setup is unreachable, please check your endpoints %s",
-				client.Endpoints())
+		if isErrObjectNotFound(err) {
+			return nil, ObjectInfo{}, errConfigNotFound
 		}
-		return fmt.Errorf("unexpected error %s returned by etcd setup, please check your endpoints %s",
-			err, client.Endpoints())
+
+		return nil, ObjectInfo{}, err
 	}
-	return nil
-}
+	defer r.Close()
 
-func deleteConfig(ctx context.Context, objAPI ObjectLayer, configFile string) error {
-	return objAPI.DeleteObject(ctx, minioMetaBucket, configFile)
-}
-
-func saveConfigEtcd(ctx context.Context, client *etcd.Client, configFile string, data []byte) error {
-	timeoutCtx, cancel := context.WithTimeout(ctx, defaultContextTimeout)
-	defer cancel()
-	_, err := client.Put(timeoutCtx, configFile, string(data))
-	if err == context.DeadlineExceeded {
-		return fmt.Errorf("etcd setup is unreachable, please check your endpoints %s", client.Endpoints())
-	} else if err != nil {
-		return fmt.Errorf("unexpected error %s returned by etcd setup, please check your endpoints %s", err, client.Endpoints())
+	buf, err := io.ReadAll(r)
+	if err != nil {
+		return nil, ObjectInfo{}, err
 	}
-	return nil
+	if len(buf) == 0 {
+		return nil, ObjectInfo{}, errConfigNotFound
+	}
+	return buf, r.ObjInfo, nil
 }
 
-func saveConfig(ctx context.Context, objAPI ObjectLayer, configFile string, data []byte) error {
-	hashReader, err := hash.NewReader(bytes.NewReader(data), int64(len(data)), "", getSHA256Hash(data), int64(len(data)), globalCLIContext.StrictS3Compat)
+func readConfig(ctx context.Context, store objectIO, configFile string) ([]byte, error) {
+	buf, _, err := readConfigWithMetadata(ctx, store, configFile, ObjectOptions{})
+	return buf, err
+}
+
+type objectDeleter interface {
+	DeleteObject(ctx context.Context, bucket, object string, opts ObjectOptions) (ObjectInfo, error)
+}
+
+func deleteConfig(ctx context.Context, objAPI objectDeleter, configFile string) error {
+	_, err := objAPI.DeleteObject(ctx, minioMetaBucket, configFile, ObjectOptions{
+		DeletePrefix:       true,
+		DeletePrefixObject: true, // use prefix delete on exact object (this is an optimization to avoid fan-out calls)
+	})
+	if err != nil && isErrObjectNotFound(err) {
+		return errConfigNotFound
+	}
+	return err
+}
+
+func saveConfigWithOpts(ctx context.Context, store objectIO, configFile string, data []byte, opts ObjectOptions) error {
+	hashReader, err := hash.NewReader(ctx, bytes.NewReader(data), int64(len(data)), "", getSHA256Hash(data), int64(len(data)))
 	if err != nil {
 		return err
 	}
 
-	_, err = objAPI.PutObject(ctx, minioMetaBucket, configFile, NewPutObjReader(hashReader, nil, nil), ObjectOptions{})
+	_, err = store.PutObject(ctx, minioMetaBucket, configFile, NewPutObjReader(hashReader), opts)
 	return err
 }
 
-func readConfigEtcd(ctx context.Context, client *etcd.Client, configFile string) ([]byte, error) {
-	timeoutCtx, cancel := context.WithTimeout(ctx, defaultContextTimeout)
-	defer cancel()
-	resp, err := client.Get(timeoutCtx, configFile)
-	if err != nil {
-		if err == context.DeadlineExceeded {
-			return nil, fmt.Errorf("etcd setup is unreachable, please check your endpoints %s",
-				client.Endpoints())
-		}
-		return nil, fmt.Errorf("unexpected error %s returned by etcd setup, please check your endpoints %s",
-			err, client.Endpoints())
-	}
-	if resp.Count == 0 {
-		return nil, errConfigNotFound
-	}
-	for _, ev := range resp.Kvs {
-		if string(ev.Key) == configFile {
-			return ev.Value, nil
-		}
-	}
-	return nil, errConfigNotFound
+func saveConfig(ctx context.Context, store objectIO, configFile string, data []byte) error {
+	return saveConfigWithOpts(ctx, store, configFile, data, ObjectOptions{MaxParity: true})
 }
 
 func checkConfig(ctx context.Context, objAPI ObjectLayer, configFile string) error {
@@ -123,8 +91,6 @@ func checkConfig(ctx context.Context, objAPI ObjectLayer, configFile string) err
 			return errConfigNotFound
 		}
 
-		logger.GetReqInfo(ctx).AppendTags("configFile", configFile)
-		logger.LogIf(ctx, err)
 		return err
 	}
 	return nil

@@ -1,55 +1,84 @@
-/*
- * MinIO Cloud Storage, (C) 2019 MinIO, Inc.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// Copyright (c) 2015-2021 MinIO, Inc.
+//
+// This file is part of MinIO Object Storage stack
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 package cmd
 
 import (
 	"bytes"
 	"context"
-	"encoding/hex"
+	"errors"
 	"hash"
 	"io"
+	"sync"
 
-	"github.com/minio/minio/cmd/logger"
+	xhttp "github.com/minio/minio/internal/http"
+	"github.com/minio/minio/internal/ioutil"
+	"github.com/minio/minio/internal/ringbuffer"
 )
 
 // Calculates bitrot in chunks and writes the hash into the stream.
 type streamingBitrotWriter struct {
-	iow       *io.PipeWriter
-	h         hash.Hash
-	shardSize int64
-	canClose  chan struct{} // Needed to avoid race explained in Close() call.
+	iow          io.WriteCloser
+	closeWithErr func(err error)
+	h            hash.Hash
+	shardSize    int64
+	canClose     *sync.WaitGroup
+	byteBuf      []byte
+	finished     bool
 }
 
 func (b *streamingBitrotWriter) Write(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
+	if b.finished {
+		return 0, errors.New("bitrot write not allowed")
+	}
+	if int64(len(p)) > b.shardSize {
+		return 0, errors.New("unexpected bitrot buffer size")
+	}
+	if int64(len(p)) < b.shardSize {
+		b.finished = true
+	}
 	b.h.Reset()
 	b.h.Write(p)
 	hashBytes := b.h.Sum(nil)
 	_, err := b.iow.Write(hashBytes)
 	if err != nil {
+		b.closeWithErr(err)
 		return 0, err
 	}
-	return b.iow.Write(p)
+	n, err := b.iow.Write(p)
+	if err != nil {
+		b.closeWithErr(err)
+		return n, err
+	}
+	if n != len(p) {
+		err = io.ErrShortWrite
+		b.closeWithErr(err)
+	}
+	return n, err
 }
 
 func (b *streamingBitrotWriter) Close() error {
+	// Close the underlying writer.
+	// This will also flush the ring buffer if used.
 	err := b.iow.Close()
+
 	// Wait for all data to be written before returning else it causes race conditions.
 	// Race condition is because of io.PipeWriter implementation. i.e consider the following
 	// sequent of operations:
@@ -57,24 +86,48 @@ func (b *streamingBitrotWriter) Close() error {
 	// 2) pipe.Close()
 	// Now pipe.Close() can return before the data is read on the other end of the pipe and written to the disk
 	// Hence an immediate Read() on the file can return incorrect data.
-	<-b.canClose
+	if b.canClose != nil {
+		b.canClose.Wait()
+	}
+
+	// Recycle the buffer.
+	if b.byteBuf != nil {
+		globalBytePoolCap.Load().Put(b.byteBuf)
+		b.byteBuf = nil
+	}
 	return err
 }
 
+// newStreamingBitrotWriterBuffer returns streaming bitrot writer implementation.
+// The output is written to the supplied writer w.
+func newStreamingBitrotWriterBuffer(w io.Writer, algo BitrotAlgorithm, shardSize int64) io.Writer {
+	return &streamingBitrotWriter{iow: ioutil.NopCloser(w), h: algo.New(), shardSize: shardSize, canClose: nil, closeWithErr: func(err error) {}}
+}
+
 // Returns streaming bitrot writer implementation.
-func newStreamingBitrotWriter(disk StorageAPI, volume, filePath string, length int64, algo BitrotAlgorithm, shardSize int64) io.WriteCloser {
-	r, w := io.Pipe()
+func newStreamingBitrotWriter(disk StorageAPI, origvolume, volume, filePath string, length int64, algo BitrotAlgorithm, shardSize int64) io.Writer {
 	h := algo.New()
-	bw := &streamingBitrotWriter{w, h, shardSize, make(chan struct{})}
+	buf := globalBytePoolCap.Load().Get()
+	rb := ringbuffer.NewBuffer(buf[:cap(buf)]).SetBlocking(true)
+
+	bw := &streamingBitrotWriter{
+		iow:          ioutil.NewDeadlineWriter(rb.WriteCloser(), globalDriveConfig.GetMaxTimeout()),
+		closeWithErr: rb.CloseWithError,
+		h:            h,
+		shardSize:    shardSize,
+		canClose:     &sync.WaitGroup{},
+		byteBuf:      buf,
+	}
+	bw.canClose.Add(1)
 	go func() {
+		defer bw.canClose.Done()
+
 		totalFileSize := int64(-1) // For compressed objects length will be unknown (represented by length=-1)
 		if length != -1 {
 			bitrotSumsTotalSize := ceilFrac(length, shardSize) * int64(h.Size()) // Size used for storing bitrot checksums.
 			totalFileSize = bitrotSumsTotalSize + length
 		}
-		err := disk.CreateFile(volume, filePath, totalFileSize, r)
-		r.CloseWithError(err)
-		close(bw.canClose)
+		rb.CloseWithError(disk.CreateFile(context.TODO(), origvolume, volume, filePath, totalFileSize, rb))
 	}()
 	return bw
 }
@@ -82,7 +135,8 @@ func newStreamingBitrotWriter(disk StorageAPI, volume, filePath string, length i
 // ReadAt() implementation which verifies the bitrot hash available as part of the stream.
 type streamingBitrotReader struct {
 	disk       StorageAPI
-	rc         io.ReadCloser
+	data       []byte
+	rc         io.Reader
 	volume     string
 	filePath   string
 	tillOffset int64
@@ -96,7 +150,12 @@ func (b *streamingBitrotReader) Close() error {
 	if b.rc == nil {
 		return nil
 	}
-	return b.rc.Close()
+	if closer, ok := b.rc.(io.Closer); ok {
+		// drain the body for connection reuse at network layer.
+		xhttp.DrainBody(io.NopCloser(b.rc))
+		return closer.Close()
+	}
+	return nil
 }
 
 func (b *streamingBitrotReader) ReadAt(buf []byte, offset int64) (int, error) {
@@ -110,7 +169,11 @@ func (b *streamingBitrotReader) ReadAt(buf []byte, offset int64) (int, error) {
 		// For the first ReadAt() call we need to open the stream for reading.
 		b.currOffset = offset
 		streamOffset := (offset/b.shardSize)*int64(b.h.Size()) + offset
-		b.rc, err = b.disk.ReadFileStream(b.volume, b.filePath, streamOffset, b.tillOffset-streamOffset)
+		if len(b.data) == 0 && b.tillOffset != streamOffset {
+			b.rc, err = b.disk.ReadFileStream(context.TODO(), b.volume, b.filePath, streamOffset, b.tillOffset-streamOffset)
+		} else {
+			b.rc = io.NewSectionReader(bytes.NewReader(b.data), streamOffset, b.tillOffset-streamOffset)
+		}
 		if err != nil {
 			return 0, err
 		}
@@ -129,28 +192,24 @@ func (b *streamingBitrotReader) ReadAt(buf []byte, offset int64) (int, error) {
 		return 0, err
 	}
 	b.h.Write(buf)
-
 	if !bytes.Equal(b.h.Sum(nil), b.hashBytes) {
-		err = hashMismatchError{hex.EncodeToString(b.hashBytes), hex.EncodeToString(b.h.Sum(nil))}
-		logger.LogIf(context.Background(), err)
-		return 0, err
+		return 0, errFileCorrupt
 	}
 	b.currOffset += int64(len(buf))
 	return len(buf), nil
 }
 
 // Returns streaming bitrot reader implementation.
-func newStreamingBitrotReader(disk StorageAPI, volume, filePath string, tillOffset int64, algo BitrotAlgorithm, shardSize int64) *streamingBitrotReader {
+func newStreamingBitrotReader(disk StorageAPI, data []byte, volume, filePath string, tillOffset int64, algo BitrotAlgorithm, shardSize int64) *streamingBitrotReader {
 	h := algo.New()
 	return &streamingBitrotReader{
-		disk,
-		nil,
-		volume,
-		filePath,
-		ceilFrac(tillOffset, shardSize)*int64(h.Size()) + tillOffset,
-		0,
-		h,
-		shardSize,
-		make([]byte, h.Size()),
+		disk:       disk,
+		data:       data,
+		volume:     volume,
+		filePath:   filePath,
+		tillOffset: ceilFrac(tillOffset, shardSize)*int64(h.Size()) + tillOffset,
+		h:          h,
+		shardSize:  shardSize,
+		hashBytes:  make([]byte, h.Size()),
 	}
 }

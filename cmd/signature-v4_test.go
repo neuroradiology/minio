@@ -1,22 +1,24 @@
-/*
- * MinIO Cloud Storage, (C) 2016, 2017 MinIO, Inc.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// Copyright (c) 2015-2021 MinIO, Inc.
+//
+// This file is part of MinIO Object Storage stack
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -35,9 +37,15 @@ func niceError(code APIErrorCode) string {
 }
 
 func TestDoesPolicySignatureMatch(t *testing.T) {
+	_, fsDir, err := prepareFS(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer removeRoots([]string{fsDir})
+
 	credentialTemplate := "%s/%s/%s/s3/aws4_request"
 	now := UTCNow()
-	accessKey := globalServerConfig.GetCredential().AccessKey
+	accessKey := globalActiveCred.AccessKey
 
 	testCases := []struct {
 		form     http.Header
@@ -46,7 +54,7 @@ func TestDoesPolicySignatureMatch(t *testing.T) {
 		// (0) It should fail if 'X-Amz-Credential' is missing.
 		{
 			form:     http.Header{},
-			expected: ErrMissingFields,
+			expected: ErrCredMalformed,
 		},
 		// (1) It should fail if the access key is incorrect.
 		{
@@ -73,7 +81,7 @@ func TestDoesPolicySignatureMatch(t *testing.T) {
 				},
 				"X-Amz-Date": []string{now.Format(iso8601Format)},
 				"X-Amz-Signature": []string{
-					getSignature(getSigningKey(globalServerConfig.GetCredential().SecretKey, now,
+					getSignature(getSigningKey(globalActiveCred.SecretKey, now,
 						globalMinioDefaultRegion, serviceS3), "policy"),
 				},
 				"Policy": []string{"policy"},
@@ -84,7 +92,7 @@ func TestDoesPolicySignatureMatch(t *testing.T) {
 
 	// Run each test case individually.
 	for i, testCase := range testCases {
-		code := doesPolicySignatureMatch(testCase.form)
+		_, code := doesPolicySignatureMatch(testCase.form)
 		if code != testCase.expected {
 			t.Errorf("(%d) expected to get %s, instead got %s", i, niceError(testCase.expected), niceError(code))
 		}
@@ -92,7 +100,10 @@ func TestDoesPolicySignatureMatch(t *testing.T) {
 }
 
 func TestDoesPresignedSignatureMatch(t *testing.T) {
-	obj, fsDir, err := prepareFS()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	obj, fsDir, err := prepareFS(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,8 +117,8 @@ func TestDoesPresignedSignatureMatch(t *testing.T) {
 	now := UTCNow()
 	credentialTemplate := "%s/%s/%s/s3/aws4_request"
 
-	region := globalServerConfig.GetRegion()
-	accessKeyID := globalServerConfig.GetCredential().AccessKey
+	region := globalSite.Region()
+	accessKeyID := globalActiveCred.AccessKey
 	testCases := []struct {
 		queryParams map[string]string
 		headers     map[string]string
@@ -215,7 +226,7 @@ func TestDoesPresignedSignatureMatch(t *testing.T) {
 			expected: ErrRequestNotReadyYet,
 		},
 		// (7) Should not error with invalid region instead, call should proceed
-		// with sigature does not match.
+		// with signature does not match.
 		{
 			queryParams: map[string]string{
 				"X-Amz-Algorithm":      signV4Algorithm,
@@ -291,6 +302,9 @@ func TestDoesPresignedSignatureMatch(t *testing.T) {
 		for key, value := range testCase.headers {
 			req.Header.Set(key, value)
 		}
+
+		// parse form.
+		req.ParseForm()
 
 		// Check if it matches!
 		err := doesPresignedSignatureMatch(payloadSHA256, req, testCase.region, serviceS3)

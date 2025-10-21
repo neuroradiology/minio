@@ -1,18 +1,19 @@
-/*
- * MinIO Cloud Storage, (C) 2015, 2016, 2017 MinIO, Inc.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// Copyright (c) 2015-2023 MinIO, Inc.
+//
+// This file is part of MinIO Object Storage stack
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 // Package cmd This file implements helper functions to validate AWS
 // Signature Version '4' authorization header.
@@ -35,8 +36,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/minio/minio-go/v6/pkg/s3utils"
-	sha256 "github.com/minio/sha256-simd"
+	"github.com/minio/minio-go/v7/pkg/s3utils"
+	"github.com/minio/minio-go/v7/pkg/set"
+	"github.com/minio/minio/internal/auth"
+	"github.com/minio/minio/internal/hash/sha256"
+	xhttp "github.com/minio/minio/internal/http"
 )
 
 // AWS Signature Version '4' constants.
@@ -56,10 +60,11 @@ const (
 // getCanonicalHeaders generate a list of request headers with their values
 func getCanonicalHeaders(signedHeaders http.Header) string {
 	var headers []string
-	vals := make(http.Header)
+	vals := make(http.Header, len(signedHeaders))
 	for k, vv := range signedHeaders {
-		headers = append(headers, strings.ToLower(k))
-		vals[strings.ToLower(k)] = vv
+		k = strings.ToLower(k)
+		headers = append(headers, k)
+		vals[k] = vv
 	}
 	sort.Strings(headers)
 
@@ -91,15 +96,15 @@ func getSignedHeaders(signedHeaders http.Header) string {
 // getCanonicalRequest generate a canonical request of style
 //
 // canonicalRequest =
-//  <HTTPMethod>\n
-//  <CanonicalURI>\n
-//  <CanonicalQueryString>\n
-//  <CanonicalHeaders>\n
-//  <SignedHeaders>\n
-//  <HashedPayload>
 //
+//	<HTTPMethod>\n
+//	<CanonicalURI>\n
+//	<CanonicalQueryString>\n
+//	<CanonicalHeaders>\n
+//	<SignedHeaders>\n
+//	<HashedPayload>
 func getCanonicalRequest(extractedSignedHeaders http.Header, payload, queryStr, urlPath, method string) string {
-	rawQuery := strings.Replace(queryStr, "+", "%20", -1)
+	rawQuery := strings.ReplaceAll(queryStr, "+", "%20")
 	encodedPath := s3utils.EncodePath(urlPath)
 	canonicalRequest := strings.Join([]string{
 		method,
@@ -119,16 +124,16 @@ func getScope(t time.Time, region string) string {
 		region,
 		string(serviceS3),
 		"aws4_request",
-	}, "/")
+	}, SlashSeparator)
 	return scope
 }
 
 // getStringToSign a string based on selected query values.
 func getStringToSign(canonicalRequest string, t time.Time, scope string) string {
 	stringToSign := signV4Algorithm + "\n" + t.Format(iso8601Format) + "\n"
-	stringToSign = stringToSign + scope + "\n"
+	stringToSign += scope + "\n"
 	canonicalRequestBytes := sha256.Sum256([]byte(canonicalRequest))
-	stringToSign = stringToSign + hex.EncodeToString(canonicalRequestBytes[:])
+	stringToSign += hex.EncodeToString(canonicalRequestBytes[:])
 	return stringToSign
 }
 
@@ -147,9 +152,9 @@ func getSignature(signingKey []byte, stringToSign string) string {
 }
 
 // Check to see if Policy is signed correctly.
-func doesPolicySignatureMatch(formValues http.Header) APIErrorCode {
+func doesPolicySignatureMatch(formValues http.Header) (auth.Credentials, APIErrorCode) {
 	// For SignV2 - Signature field will be valid
-	if _, ok := formValues["Signature"]; ok {
+	if _, ok := formValues[xhttp.AmzSignatureV2]; ok {
 		return doesPolicySignatureV2Match(formValues)
 	}
 	return doesPolicySignatureV4Match(formValues)
@@ -165,21 +170,23 @@ func compareSignatureV4(sig1, sig2 string) bool {
 }
 
 // doesPolicySignatureMatch - Verify query headers with post policy
-//     - http://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-HTTPPOSTConstructPolicy.html
+//   - http://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-HTTPPOSTConstructPolicy.html
+//
 // returns ErrNone if the signature matches.
-func doesPolicySignatureV4Match(formValues http.Header) APIErrorCode {
+func doesPolicySignatureV4Match(formValues http.Header) (auth.Credentials, APIErrorCode) {
 	// Server region.
-	region := globalServerConfig.GetRegion()
+	region := globalSite.Region()
 
 	// Parse credential tag.
-	credHeader, err := parseCredentialHeader("Credential="+formValues.Get("X-Amz-Credential"), region, serviceS3)
-	if err != ErrNone {
-		return ErrMissingFields
+	credHeader, s3Err := parseCredentialHeader("Credential="+formValues.Get(xhttp.AmzCredential), region, serviceS3)
+	if s3Err != ErrNone {
+		return auth.Credentials{}, s3Err
 	}
 
-	cred, _, s3Err := checkKeyValid(credHeader.accessKey)
+	r := &http.Request{Header: formValues}
+	cred, _, s3Err := checkKeyValid(r, credHeader.accessKey)
 	if s3Err != ErrNone {
-		return s3Err
+		return cred, s3Err
 	}
 
 	// Get signing key.
@@ -189,28 +196,29 @@ func doesPolicySignatureV4Match(formValues http.Header) APIErrorCode {
 	newSignature := getSignature(signingKey, formValues.Get("Policy"))
 
 	// Verify signature.
-	if !compareSignatureV4(newSignature, formValues.Get("X-Amz-Signature")) {
-		return ErrSignatureDoesNotMatch
+	if !compareSignatureV4(newSignature, formValues.Get(xhttp.AmzSignature)) {
+		return cred, ErrSignatureDoesNotMatch
 	}
 
 	// Success.
-	return ErrNone
+	return cred, ErrNone
 }
 
 // doesPresignedSignatureMatch - Verify query headers with presigned signature
-//     - http://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-query-string-auth.html
+//   - http://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-query-string-auth.html
+//
 // returns ErrNone if the signature matches.
 func doesPresignedSignatureMatch(hashedPayload string, r *http.Request, region string, stype serviceType) APIErrorCode {
 	// Copy request
 	req := *r
 
 	// Parse request query string.
-	pSignValues, err := parsePreSignV4(req.URL.Query(), region, stype)
+	pSignValues, err := parsePreSignV4(req.Form, region, stype)
 	if err != ErrNone {
 		return err
 	}
 
-	cred, _, s3Err := checkKeyValid(pSignValues.Credential.accessKey)
+	cred, _, s3Err := checkKeyValid(r, pSignValues.Credential.accessKey)
 	if s3Err != ErrNone {
 		return s3Err
 	}
@@ -221,13 +229,11 @@ func doesPresignedSignatureMatch(hashedPayload string, r *http.Request, region s
 		return errCode
 	}
 
-	// Construct new query.
-	query := make(url.Values)
-	if req.URL.Query().Get("X-Amz-Content-Sha256") != "" {
-		query.Set("X-Amz-Content-Sha256", hashedPayload)
+	// Check if the metadata headers are equal with signedheaders
+	errMetaCode := checkMetaHeaders(extractedSignedHeaders, r)
+	if errMetaCode != ErrNone {
+		return errMetaCode
 	}
-
-	query.Set("X-Amz-Algorithm", signV4Algorithm)
 
 	// If the host which signed the request is slightly ahead in time (by less than globalMaxSkewTime) the
 	// request should still be allowed.
@@ -243,59 +249,73 @@ func doesPresignedSignatureMatch(hashedPayload string, r *http.Request, region s
 	t := pSignValues.Date
 	expireSeconds := int(pSignValues.Expires / time.Second)
 
+	// Construct new query.
+	query := make(url.Values)
+	clntHashedPayload := req.Form.Get(xhttp.AmzContentSha256)
+	if clntHashedPayload != "" {
+		query.Set(xhttp.AmzContentSha256, hashedPayload)
+	}
+
+	token := req.Form.Get(xhttp.AmzSecurityToken)
+	if token != "" {
+		query.Set(xhttp.AmzSecurityToken, cred.SessionToken)
+	}
+
+	query.Set(xhttp.AmzAlgorithm, signV4Algorithm)
+
 	// Construct the query.
-	query.Set("X-Amz-Date", t.Format(iso8601Format))
-	query.Set("X-Amz-Expires", strconv.Itoa(expireSeconds))
-	query.Set("X-Amz-SignedHeaders", getSignedHeaders(extractedSignedHeaders))
-	query.Set("X-Amz-Credential", cred.AccessKey+"/"+pSignValues.Credential.getScope())
+	query.Set(xhttp.AmzDate, t.Format(iso8601Format))
+	query.Set(xhttp.AmzExpires, strconv.Itoa(expireSeconds))
+	query.Set(xhttp.AmzSignedHeaders, strings.Join(pSignValues.SignedHeaders, ";"))
+	query.Set(xhttp.AmzCredential, cred.AccessKey+SlashSeparator+pSignValues.Credential.getScope())
 
-	// Save other headers available in the request parameters.
-	for k, v := range req.URL.Query() {
-		key := strings.ToLower(k)
+	defaultSigParams := set.CreateStringSet(
+		xhttp.AmzContentSha256,
+		xhttp.AmzSecurityToken,
+		xhttp.AmzAlgorithm,
+		xhttp.AmzDate,
+		xhttp.AmzExpires,
+		xhttp.AmzSignedHeaders,
+		xhttp.AmzCredential,
+		xhttp.AmzSignature,
+	)
 
-		// Handle the metadata in presigned put query string
-		if strings.Contains(key, "x-amz-meta-") {
-			query.Set(k, v[0])
-			continue
+	// Add missing query parameters if any provided in the request URL
+	for k, v := range req.Form {
+		if !defaultSigParams.Contains(k) {
+			query[k] = v
 		}
-
-		if strings.Contains(key, "x-amz-server-side-") {
-			query.Set(k, v[0])
-		}
-
-		if strings.HasPrefix(key, "x-amz") {
-			continue
-		}
-		query[k] = v
 	}
 
 	// Get the encoded query.
 	encodedQuery := query.Encode()
 
 	// Verify if date query is same.
-	if req.URL.Query().Get("X-Amz-Date") != query.Get("X-Amz-Date") {
+	if req.Form.Get(xhttp.AmzDate) != query.Get(xhttp.AmzDate) {
 		return ErrSignatureDoesNotMatch
 	}
 	// Verify if expires query is same.
-	if req.URL.Query().Get("X-Amz-Expires") != query.Get("X-Amz-Expires") {
+	if req.Form.Get(xhttp.AmzExpires) != query.Get(xhttp.AmzExpires) {
 		return ErrSignatureDoesNotMatch
 	}
 	// Verify if signed headers query is same.
-	if req.URL.Query().Get("X-Amz-SignedHeaders") != query.Get("X-Amz-SignedHeaders") {
+	if req.Form.Get(xhttp.AmzSignedHeaders) != query.Get(xhttp.AmzSignedHeaders) {
 		return ErrSignatureDoesNotMatch
 	}
 	// Verify if credential query is same.
-	if req.URL.Query().Get("X-Amz-Credential") != query.Get("X-Amz-Credential") {
+	if req.Form.Get(xhttp.AmzCredential) != query.Get(xhttp.AmzCredential) {
 		return ErrSignatureDoesNotMatch
 	}
 	// Verify if sha256 payload query is same.
-	if req.URL.Query().Get("X-Amz-Content-Sha256") != "" {
-		if req.URL.Query().Get("X-Amz-Content-Sha256") != query.Get("X-Amz-Content-Sha256") {
-			return ErrContentSHA256Mismatch
-		}
+	if clntHashedPayload != "" && clntHashedPayload != query.Get(xhttp.AmzContentSha256) {
+		return ErrContentSHA256Mismatch
+	}
+	// Verify if security token is correct.
+	if token != "" && subtle.ConstantTimeCompare([]byte(token), []byte(cred.SessionToken)) != 1 {
+		return ErrInvalidToken
 	}
 
-	/// Verify finally if signature is same.
+	// Verify finally if signature is same.
 
 	// Get canonical request.
 	presignedCanonicalReq := getCanonicalRequest(extractedSignedHeaders, hashedPayload, encodedQuery, req.URL.Path, req.Method)
@@ -311,21 +331,25 @@ func doesPresignedSignatureMatch(hashedPayload string, r *http.Request, region s
 	newSignature := getSignature(presignedSigningKey, presignedStringToSign)
 
 	// Verify signature.
-	if !compareSignatureV4(req.URL.Query().Get("X-Amz-Signature"), newSignature) {
+	if !compareSignatureV4(req.Form.Get(xhttp.AmzSignature), newSignature) {
 		return ErrSignatureDoesNotMatch
 	}
+
+	r.Header.Set("x-amz-signature-age", strconv.FormatInt(UTCNow().Sub(pSignValues.Date).Milliseconds(), 10))
+
 	return ErrNone
 }
 
 // doesSignatureMatch - Verify authorization header with calculated header in accordance with
-//     - http://docs.aws.amazon.com/AmazonS3/latest/API/sig-v4-authenticating-requests.html
+//   - http://docs.aws.amazon.com/AmazonS3/latest/API/sig-v4-authenticating-requests.html
+//
 // returns ErrNone if signature matches.
 func doesSignatureMatch(hashedPayload string, r *http.Request, region string, stype serviceType) APIErrorCode {
 	// Copy request.
 	req := *r
 
 	// Save authorization header.
-	v4Auth := req.Header.Get("Authorization")
+	v4Auth := req.Header.Get(xhttp.Authorization)
 
 	// Parse signature version '4' header.
 	signV4Values, err := parseSignV4(v4Auth, region, stype)
@@ -339,15 +363,15 @@ func doesSignatureMatch(hashedPayload string, r *http.Request, region string, st
 		return errCode
 	}
 
-	cred, _, s3Err := checkKeyValid(signV4Values.Credential.accessKey)
+	cred, _, s3Err := checkKeyValid(r, signV4Values.Credential.accessKey)
 	if s3Err != ErrNone {
 		return s3Err
 	}
 
 	// Extract date, if not present throw error.
 	var date string
-	if date = req.Header.Get(http.CanonicalHeaderKey("x-amz-date")); date == "" {
-		if date = r.Header.Get("Date"); date == "" {
+	if date = req.Header.Get(xhttp.AmzDate); date == "" {
+		if date = r.Header.Get(xhttp.Date); date == "" {
 			return ErrMissingDateHeader
 		}
 	}
@@ -359,7 +383,7 @@ func doesSignatureMatch(hashedPayload string, r *http.Request, region string, st
 	}
 
 	// Query string.
-	queryStr := req.URL.Query().Encode()
+	queryStr := req.Form.Encode()
 
 	// Get canonical request.
 	canonicalRequest := getCanonicalRequest(extractedSignedHeaders, hashedPayload, queryStr, req.URL.Path, req.Method)

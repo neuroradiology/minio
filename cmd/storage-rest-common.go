@@ -1,61 +1,86 @@
-/*
- * MinIO Cloud Storage, (C) 2018 MinIO, Inc.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// Copyright (c) 2015-2024 MinIO, Inc.
+//
+// This file is part of MinIO Object Storage stack
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 package cmd
 
-const storageRESTVersion = "v6"
-const storageRESTPath = minioReservedBucketPath + "/storage/" + storageRESTVersion + "/"
+//go:generate msgp -file $GOFILE -unexported
 
 const (
-	storageRESTMethodDiskInfo  = "diskinfo"
-	storageRESTMethodMakeVol   = "makevol"
-	storageRESTMethodStatVol   = "statvol"
-	storageRESTMethodDeleteVol = "deletevol"
-	storageRESTMethodListVols  = "listvols"
-
-	storageRESTMethodAppendFile     = "appendfile"
-	storageRESTMethodCreateFile     = "createfile"
-	storageRESTMethodWriteAll       = "writeall"
-	storageRESTMethodStatFile       = "statfile"
-	storageRESTMethodReadAll        = "readall"
-	storageRESTMethodReadFile       = "readfile"
-	storageRESTMethodReadFileStream = "readfilestream"
-	storageRESTMethodListDir        = "listdir"
-	storageRESTMethodWalk           = "walk"
-	storageRESTMethodDeleteFile     = "deletefile"
-	storageRESTMethodDeleteFileBulk = "deletefilebulk"
-	storageRESTMethodRenameFile     = "renamefile"
-	storageRESTMethodGetInstanceID  = "getinstanceid"
+	storageRESTVersion       = "v63" // Introduce RenamePart and ReadParts API
+	storageRESTVersionPrefix = SlashSeparator + storageRESTVersion
+	storageRESTPrefix        = minioReservedBucketPath + "/storage"
 )
 
 const (
-	storageRESTVolume     = "volume"
-	storageRESTDirPath    = "dir-path"
-	storageRESTFilePath   = "file-path"
-	storageRESTSrcVolume  = "source-volume"
-	storageRESTSrcPath    = "source-path"
-	storageRESTDstVolume  = "destination-volume"
-	storageRESTDstPath    = "destination-path"
-	storageRESTOffset     = "offset"
-	storageRESTLength     = "length"
-	storageRESTCount      = "count"
-	storageRESTMarkerPath = "marker"
-	storageRESTLeafFile   = "leaf-file"
-	storageRESTRecursive  = "recursive"
-	storageRESTBitrotAlgo = "bitrot-algo"
-	storageRESTBitrotHash = "bitrot-hash"
-	storageRESTInstanceID = "instance-id"
+	storageRESTMethodHealth = "/health"
+
+	storageRESTMethodAppendFile     = "/afile"
+	storageRESTMethodCreateFile     = "/cfile"
+	storageRESTMethodWriteAll       = "/wall"
+	storageRESTMethodReadVersion    = "/rver"
+	storageRESTMethodReadXL         = "/rxl"
+	storageRESTMethodReadAll        = "/rall"
+	storageRESTMethodReadFile       = "/rfile"
+	storageRESTMethodReadFileStream = "/rfilest"
+	storageRESTMethodListDir        = "/ls"
+	storageRESTMethodDeleteVersions = "/dvers"
+	storageRESTMethodRenameFile     = "/rfile"
+	storageRESTMethodVerifyFile     = "/vfile"
+	storageRESTMethodStatInfoFile   = "/sfile"
+	storageRESTMethodReadMultiple   = "/rmpl"
+	storageRESTMethodCleanAbandoned = "/cln"
+	storageRESTMethodDeleteBulk     = "/dblk"
+	storageRESTMethodReadParts      = "/rps"
 )
+
+const (
+	storageRESTVolume           = "vol"
+	storageRESTVolumes          = "vols"
+	storageRESTDirPath          = "dpath"
+	storageRESTFilePath         = "fp"
+	storageRESTVersionID        = "vid"
+	storageRESTHealing          = "heal"
+	storageRESTTotalVersions    = "tvers"
+	storageRESTSrcVolume        = "svol"
+	storageRESTSrcPath          = "spath"
+	storageRESTDstVolume        = "dvol"
+	storageRESTDstPath          = "dpath"
+	storageRESTOffset           = "offset"
+	storageRESTLength           = "length"
+	storageRESTCount            = "count"
+	storageRESTBitrotAlgo       = "balg"
+	storageRESTBitrotHash       = "bhash"
+	storageRESTDiskID           = "did"
+	storageRESTForceDelete      = "fdel"
+	storageRESTGlob             = "glob"
+	storageRESTMetrics          = "metrics"
+	storageRESTDriveQuorum      = "dquorum"
+	storageRESTOrigVolume       = "ovol"
+	storageRESTInclFreeVersions = "incl-fv"
+	storageRESTRange            = "rng"
+)
+
+type nsScannerOptions struct {
+	DiskID   string          `msg:"id"`
+	ScanMode int             `msg:"m"`
+	Cache    *dataUsageCache `msg:"c"`
+}
+
+type nsScannerResp struct {
+	Update *dataUsageEntry `msg:"u"`
+	Final  *dataUsageCache `msg:"f"`
+}

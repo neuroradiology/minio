@@ -1,11 +1,19 @@
 ---
 name: Bug report
-about: Create a report to help us improve
+about: Report a bug in MinIO (community edition is source-only)
 title: ''
 labels: community, triage
 assignees: ''
 
 ---
+
+## IMPORTANT NOTES
+
+**Community Edition**: MinIO community edition is now source-only. Install via `go install github.com/minio/minio@latest`
+
+**Feature Requests**: We are no longer accepting feature requests for the community edition. For feature requests and enterprise support, please subscribe to [MinIO Enterprise Support](https://min.io/pricing).
+
+**Urgent Issues**: If this case is urgent or affects production, please subscribe to [SUBNET](https://min.io/pricing) for 24/7 enterprise support.
 
 <!--- Provide a general summary of the issue in the Title above -->
 
@@ -24,6 +32,8 @@ assignees: ''
 ## Steps to Reproduce (for bugs)
 <!--- Provide a link to a live example, or an unambiguous set of steps to -->
 <!--- reproduce this bug. Include code to reproduce, if relevant -->
+<!--- and make sure you have followed https://github.com/minio/minio/tree/release/docs/debugging to capture relevant logs -->
+
 1.
 2.
 3.
@@ -39,8 +49,6 @@ assignees: ''
 
 ## Your Environment
 <!--- Include as many relevant details about the environment you experienced the bug in -->
-* Version used (`minio version`):
-* Environment name and version (e.g. nginx 1.9.1):
-* Server type and version:
+* Version used (`minio --version`):
+* Server setup and configuration:
 * Operating System and version (`uname -a`):
-* Link to your project:
